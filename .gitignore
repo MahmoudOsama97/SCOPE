@@ -19,7 +19,8 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
+exps/
+datasets/
 # Virtual Environment
 venv/
 env/
@@ -60,3 +61,4 @@ coverage.xml
 *.log
 
 exps
+datasets

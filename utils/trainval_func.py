@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import random
 from network.get_network import feats_extractor
+import copy
+from utils.fed_merge import FedAvg
 
 def Shuffle_Batch_Data(data_in):
     len_total = len(data_in)
@@ -150,6 +152,63 @@ def GetFedModel(args, num_classes, is_train=True):
     
     return global_model, model_dict, optimizer_dict, scheduler_dict
 
+
+def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log_file, log_ten, metric, note='after_fed', model_dict=None, domain_stats=None, weight_dict=None):
+    """
+    Test-time evaluation for Fed-Tune.
+    Dynamically builds a hybrid model for each batch by blending the best
+    private "style" trunks and fusing them with the global "content" trunk.
+    """
+    global_model.eval()
+    
+    # Create a deepcopy of the global model to use as a template
+    hybrid_model = copy.deepcopy(global_model)
+
+    with torch.no_grad():
+        for imgs, labels, domain_labels, in tqdm(dataloader):
+            imgs = imgs.cuda()
+            
+            # 1. Get similarities (same as before)
+            # This uses the global model's featurizer to maintain consistency
+            # 1. Get similarities
+            # --- MODIFIED LINE: Pass the featurizer part of the global_model ---
+            # global_model.model[0] is the featurizer from the wrapped global model
+            intermediate_features = feats_extractor(imgs, global_model.model[0], avg_tokens=args.avg_tokens, num_layers=args.num_layers)
+            # --- END OF MODIFIED LINE ---
+
+            similarities = domain_stats.get_domain_weights(intermediate_features)
+            batch_similarities = F.softmax(torch.mean(similarities, dim=0) * args.inv_temp, dim=0)
+
+            # 2. Dynamically build a new private trunk via weighted average
+
+            # --- START OF MODIFIED CODE ---
+            # Access private_blocks_count from the wrapper object directly
+            private_blocks_count = global_model.private_blocks_count
+            
+            # Use this correct count for slicing
+            avg_private_trunk_state = FedAvg(
+                [model_dict[name].model[0].blocks[:private_blocks_count].state_dict() for name in args.site_list],
+                batch_similarities.tolist()
+            )
+            
+            # Correctly load the state into the hybrid model's private blocks
+            hybrid_model.model[0].blocks[:private_blocks_count].load_state_dict(avg_private_trunk_state)
+            # --- END OF MODIFIED CODE ---
+            
+            # 3. The shared trunk and head are already the global ones from the deepcopy.
+            # Now, predict with the assembled hybrid model.
+            out = hybrid_model(imgs)
+            metric.update(out, labels)
+            
+    results_dict = metric.results()
+    log_ten.add_scalar(f'{note}_{site_name}_loss', results_dict['loss'], epochs)
+    log_ten.add_scalar(f'{note}_{site_name}_acc', results_dict['acc'], epochs)
+    log_file.info(f'{note} Round: {epochs:3d} | Domain: {site_name} | loss: {results_dict["loss"]:.4f} | Acc: {results_dict["acc"]*100:.2f}%')
+    
+    return results_dict
+
+# +++ END OF NEW FUNCTION +++
+
 def SaveCheckPoint(args, model, epochs, path, optimizer=None, schedule=None, note='best_val'):
     check_dict = {'args':args, 'epochs':epochs, 'model':model.state_dict(), 'note': note}
     if optimizer is not None:
@@ -183,8 +242,13 @@ def feddgmoe_testsite_eval(epochs, site_name, args, model, dataloader, log_file,
     with torch.no_grad():
         for imgs, labels, domain_labels, in tqdm(dataloader):
             imgs = imgs.cuda()
-            intermediate_features = feats_extractor(imgs.cuda(), model[0], avg_tokens=args.avg_tokens, num_layers=args.num_layers)
-            
+
+
+            # --- MODIFIED LINE ---
+            # Call feats_extractor on the full global_model, not a piece of it.
+            intermediate_features = feats_extractor(imgs, global_model, avg_tokens=args.avg_tokens, num_layers=args.num_layers)
+            # --- END OF MODIFIED LINE ---
+
             # Calculate domain similarities based on the aggregation type (raw scores - no softmax yet)
             if args.batch_agg_type == "pre_similarity":
                 # Average features first, then compute similarities (v2 behavior)

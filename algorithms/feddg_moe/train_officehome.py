@@ -1,4 +1,8 @@
 import os
+import sys
+# Add the parent directories to the Python path to allow for package-like imports
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+
 import argparse
 from network.get_network import GetNetwork, feats_extractor
 from torch.utils.tensorboard.writer import SummaryWriter
@@ -6,10 +10,11 @@ from data.officehome_dataset import OfficeHome_FedDG
 from utils.classification_metric import Classification 
 from utils.log_utils import *
 from utils.fed_merge import Cal_Weight_Dict, FedAvg, FedUpdate
-from utils.trainval_func import site_evaluation, feddgmoe_site_train, feddgmoe_testsite_eval, GetFedModel, SaveCheckPoint
+from utils.trainval_func import site_evaluation, feddgmoe_site_train, FedTune_testsite_eval, GetFedModel, SaveCheckPoint
 import torch.nn.functional as F
 from tqdm import tqdm
 import torch
+import copy # <-- Add this import at the top
 
 from utils.domain_stats.online.online_cosine import OnlineCosineTracker
 from utils.domain_stats.online.online_gmm import OnlineGMMTracker
@@ -36,7 +41,10 @@ def collect_offline_stats(model, dataloader, domain_stats, domain_id, args):
     all_features = []
     with torch.no_grad():
         for inputs, _, _ in dataloader:
-            features = feats_extractor(inputs.cuda(), model, avg_tokens=args.avg_tokens, num_layers=args.num_layers)
+            # --- MODIFIED LINE: Pass the featurizer part of the model ---
+            # model.model is the nn.Sequential, model.model[0] is the featurizer
+            features = feats_extractor(inputs.cuda(), model.model[0], avg_tokens=args.avg_tokens, num_layers=args.num_layers)
+            # --- END OF MODIFIED LINE ---
             all_features.append(features)
     all_features = torch.cat(all_features, dim=0)
     domain_stats.refit(all_features, domain_id)  # Call the refit method
@@ -45,7 +53,7 @@ def get_argparse():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default='officehome', choices=['officehome'], help='Name of dataset')
     parser.add_argument("--model", type=str, default='clip_moe',
-                        choices=['resnet18', 'resnet50', 'clip', 'clip_moe', 'clip_moe_layers'], help='model name')
+                        choices=['resnet18', 'resnet50', 'clip', 'clip_moe', 'clip_moe_style'], help='model name')
     parser.add_argument("--test_domain", type=str, default='p',
                         choices=['p', 'a', 'c', 'r'], help='the domain name for testing')
     parser.add_argument('--num_classes', help='number of classes default 65', type=int, default=65)
@@ -139,35 +147,42 @@ def main():
 
     FedUpdate(model_dict, global_model)
     best_val = 0.
-    for i in range(args.comm+1):
-        FedUpdate(model_dict, global_model)
+    for i in range(args.comm + 1):
+        # 1. Distribution: Send global shared params to all clients
+        if i > 0: # No distribution on the first round
+            global_shared_params = global_model.get_shared_params()
+            for domain_name in dataobj.train_domain_list:
+                model_dict[domain_name].load_shared_params(global_shared_params)
+
+        # 2. Local Training and Stats Collection
         for domain_id, domain_name in enumerate(dataobj.train_domain_list):
-            # Train Domain[i]
             feddgmoe_site_train(i, domain_name, args, model_dict[domain_name], optimizer_dict[domain_name], 
                       scheduler_dict[domain_name], dataloader_dict[domain_name]['train'], log_ten, metric)
             
-            # Update Domain [i] Statistics
-            collect_stats(model_dict[domain_name][0], dataloader_dict[domain_name]['train'], domain_stats, domain_id, args)
-
-            # Val Domain[i]
+            collect_stats(model_dict[domain_name], dataloader_dict[domain_name]['train'], domain_stats, domain_id, args)
+            
+            # Optional: You can still evaluate the performance of each full client model
             site_evaluation(i, domain_name, args, model_dict[domain_name], dataloader_dict[domain_name]['val'], log_file, log_ten, metric, note='before_fed')
 
-        FedAvg(model_dict, weight_dict, global_model)
+        # 3. Aggregation: Collect shared params and average them into the global model
+        client_shared_params = [model_dict[name].get_shared_params() for name in dataobj.train_domain_list]
+        client_weights = [weight_dict[name] for name in dataobj.train_domain_list]
+        global_avg_shared_params = FedAvg(client_shared_params, client_weights)
+        global_model.load_shared_params(global_avg_shared_params)
         
+        # 4. Validation of the new global model
         fed_val = 0.
         for domain_name in dataobj.train_domain_list:
             results_dict = site_evaluation(i, domain_name, args, global_model, dataloader_dict[domain_name]['val'], log_file, log_ten, metric)
-            fed_val+= results_dict['acc']*weight_dict[domain_name]
-        # val
+            fed_val += results_dict['acc'] * weight_dict[domain_name]
+        
         if fed_val >= best_val:
-            best_val = fed_val
+            # ... (Saving checkpoints logic is fine, but save global_model)
             SaveCheckPoint(args, global_model, args.comm, os.path.join(log_dir, 'checkpoints'), note='best_val_model')
-            for domain_name in dataobj.train_domain_list: 
-                SaveCheckPoint(args, model_dict[domain_name], args.comm, os.path.join(log_dir, 'checkpoints'), note=f'best_val_{domain_name}_model')
-                
-            log_file.info(f'Model saved! Best Val Acc: {best_val*100:.2f}%')
-    
-        feddgmoe_testsite_eval(i, args.test_domain, args, global_model, dataloader_dict[args.test_domain]['test'], 
+            log_file.info(f'Global model saved! Best Val Acc: {best_val*100:.2f}%')
+
+        # 5. Test using the new hybrid evaluation function
+        FedTune_testsite_eval(i, args.test_domain, args, global_model, dataloader_dict[args.test_domain]['test'], 
                          log_file, log_ten, metric, note='test_domain', model_dict=model_dict, domain_stats=domain_stats,
                          weight_dict=weight_dict)
         

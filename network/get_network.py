@@ -5,6 +5,54 @@ import timm
 import torch
 from typing import Union, List, Tuple
 
+from collections import OrderedDict
+
+# +++ START: ADD THIS NEW WRAPPER CLASS +++
+class FedWrapper(nn.Module):
+    """
+    A simple wrapper that takes a fully functional model and provides
+    methods to get/load a subset of its parameters for federation,
+    without altering its proven forward pass.
+    """
+    def __init__(self, model, private_blocks_count=4):
+        super().__init__()
+        # Store the complete, working model
+        self.model = model
+
+        # --- START OF MODIFIED/NEW CODE ---
+        # Save the count as an instance attribute so we can access it later
+        self.private_blocks_count = private_blocks_count
+        # --- END OF MODIFIED/NEW CODE ---
+        # Define direct references to the shared components for easy access.
+        # self.model[0] is the featurizer, self.model[1] is the classifier.
+        self.shared_blocks = self.model[0].blocks[private_blocks_count:]
+        self.classifier_head = self.model[1]
+
+    def forward(self, x):
+        # Simply delegate the forward pass to the wrapped model.
+        # This guarantees identical behavior to the baseline.
+        return self.model(x)
+
+    def get_shared_params(self):
+        """Returns the state_dict of only the shared components."""
+        shared_state = OrderedDict()
+        for name, param in self.shared_blocks.named_parameters():
+            if param.requires_grad:
+                shared_state[f'0.blocks.{name}'] = param.data.clone()
+        for name, param in self.classifier_head.named_parameters():
+            shared_state[f'1.{name}'] = param.data.clone()
+        return shared_state
+
+    def load_shared_params(self, shared_state_dict):
+        """
+        Loads a state_dict into the shared components of the wrapped model.
+        We use self.model.load_state_dict because the keys in shared_state_dict
+        are generated to match the structure of the full sequential model.
+        """
+        self.model.load_state_dict(shared_state_dict, strict=False)
+
+# +++ END: NEW WRAPPER CLASS +++
+
 
 def my_get_intermediate_layers(
         featurizer,
@@ -46,6 +94,14 @@ def my_get_intermediate_layers(
     # forward pass
     B, _, height, width = x.shape
     x = featurizer.patch_embed(x)
+    
+    # +++ START OF MODIFIED/NEW CODE +++
+
+    # Add the CLS token before positional embedding
+    cls_tokens = featurizer.cls_token.expand(B, -1, -1)
+    x = torch.cat((cls_tokens, x), dim=1)
+
+    # +++ END OF MODIFIED/NEW CODE +++
     
     # Apply positional embedding
     if hasattr(featurizer, '_pos_embed'):
@@ -175,6 +231,24 @@ def GetNetwork(args, num_classes, pretrained=True, **kwargs):
         inject_trainable_moe_kronecker_new(featurizer, r=[1, 2, 4, 8], where='every_qkv')
         classifier = nn.Linear(feature_level, num_classes)
         model = nn.Sequential(featurizer, classifier)
+    # MODIFIED: Replace the old 'clip_moe' with the new FedTuneMoE
+    elif args.model == 'clip_moe_style':
+        # 1. Build the model exactly like the high-performing baseline
+        featurizer = timm.create_model('vit_base_patch16_clip_224.laion2b', pretrained=True)
+        feature_level = featurizer.num_features
+        featurizer.head = Identity()
+        for name, param in featurizer.named_parameters():
+            # Freeze everything initially
+            param.requires_grad = False
+        
+        # Inject adapters, which makes them trainable
+        inject_trainable_moe_kronecker_new(featurizer, r=[1, 2, 4, 8], where='every_qkv')
+        
+        classifier = nn.Linear(feature_level, num_classes)
+        sequential_model = nn.Sequential(featurizer, classifier)
+        
+        # 2. Wrap the proven model in our new federated container
+        model = FedWrapper(sequential_model, private_blocks_count=4)
 
     else:
         raise ValueError("The model is not support")

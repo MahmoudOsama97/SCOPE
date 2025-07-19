@@ -1,3 +1,6 @@
+from collections import OrderedDict
+
+
 def Dict_weight(dict_in, weight_in):
     for k,v in dict_in.items():
         dict_in[k] = weight_in*v
@@ -25,21 +28,33 @@ def Cal_Weight_Dict(dataset_dict, site_list=None):
         weight_dict[site_name] = site_len/total_len
     return weight_dict
 
-def FedAvg(model_dict, weight_dict, global_model=None):
-    new_model_dict = None
-    for model_name in weight_dict.keys():
-        model = model_dict[model_name]
-        model_state_dict = model.state_dict()
-        if new_model_dict is None:
-            new_model_dict = Dict_weight(model_state_dict, weight_dict[model_name])
-        else:
-            new_model_dict = Dict_Add(new_model_dict, Dict_weight(model_state_dict, weight_dict[model_name]))
-    
-    if global_model is None:
-        return new_model_dict
-    else:
-        global_model.load_state_dict(new_model_dict)
-        return new_model_dict
+# +++ START: REPLACE THE OLD FedAvg WITH THIS +++
+def FedAvg(client_states: list, client_weights: list):
+    """
+    Performs Federated Averaging on a list of state dictionaries.
+
+    Args:
+        client_states (list): A list of model state_dicts to be averaged.
+        client_weights (list): A list of weights corresponding to each state_dict.
+
+    Returns:
+        OrderedDict: The globally averaged state_dict.
+    """
+    # Ensure the inputs are valid
+    if not client_states or not client_weights or len(client_states) != len(client_weights):
+        raise ValueError("Inputs to FedAvg are invalid.")
+
+    # Get the keys from the first state dictionary
+    keys = client_states[0].keys()
+    avg_state = OrderedDict()
+
+    # Iterate through each parameter key
+    for key in keys:
+        # Calculate the weighted sum for the current parameter
+        weighted_sum = sum(state[key] * weight for state, weight in zip(client_states, client_weights))
+        avg_state[key] = weighted_sum
+
+    return avg_state
 
 def FedUpdate(model_dict, global_model):
     global_model_parameters = global_model.state_dict()

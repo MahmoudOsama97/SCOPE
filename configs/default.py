@@ -5,6 +5,6 @@ terra_incognita_list = ['100', '38', '43', '46']
 
 log_count_path = 'exps/'
 pacs_path = '/home/ahmedm04/projects/distill_part_whole/FedDG-GA/datasets/PACS'
-officehome_path = '/home/ahmedm04/projects/distill_part_whole/FedDG-GA/datasets/OfficeHome'
+officehome_path = '/home/mosama97/UBCO/research/FedDG-MoE-PS/datasets/office_homeOriginal'
 vlcs_path = '/home/ahmedm04/projects/distill_part_whole/FedDG-GA/datasets/VLCS'
 terrainc_path = ''
