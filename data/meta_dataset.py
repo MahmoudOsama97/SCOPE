@@ -1,9 +1,10 @@
 import torch
 from torch.utils.data import Dataset
-from PIL import Image
+from PIL import Image, ImageFile
 
 import numpy as np
 import cv2
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 dataloader_kwargs = {'num_workers': 4, 'pin_memory': True}
 def GetDataLoaderDict(dataset_dict, batch_size):

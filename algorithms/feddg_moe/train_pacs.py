@@ -1,4 +1,8 @@
 import os
+import sys
+# Add the parent directories to the Python path to allow for package-like imports
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+
 import argparse
 from network.get_network import GetNetwork, feats_extractor
 from torch.utils.tensorboard.writer import SummaryWriter
@@ -6,10 +10,11 @@ from data.pacs_dataset import PACS_FedDG
 from utils.classification_metric import Classification 
 from utils.log_utils import *
 from utils.fed_merge import Cal_Weight_Dict, FedAvg, FedUpdate
-from utils.trainval_func import site_evaluation, feddgmoe_site_train, feddgmoe_testsite_eval, GetFedModel, SaveCheckPoint
+from utils.trainval_func import site_evaluation, feddgmoe_site_train, FedTune_testsite_eval, GetFedModel, SaveCheckPoint
 import torch.nn.functional as F
 from tqdm import tqdm
 import torch
+import copy # <-- Add this import at the top
 
 from utils.domain_stats.online.online_cosine import OnlineCosineTracker
 from utils.domain_stats.online.online_gmm import OnlineGMMTracker
@@ -36,7 +41,10 @@ def collect_offline_stats(model, dataloader, domain_stats, domain_id, args):
     all_features = []
     with torch.no_grad():
         for inputs, _, _ in dataloader:
-            features = feats_extractor(inputs.cuda(), model, avg_tokens=args.avg_tokens, num_layers=args.num_layers)
+            # --- MODIFIED LINE: Pass the featurizer part of the model ---
+            # model.model is the nn.Sequential, model.model[0] is the featurizer
+            features = feats_extractor(inputs.cuda(), model.model[0], avg_tokens=args.avg_tokens, num_layers=args.num_layers)
+            # --- END OF MODIFIED LINE ---
             all_features.append(features)
     all_features = torch.cat(all_features, dim=0)
     domain_stats.refit(all_features, domain_id)  # Call the refit method
@@ -45,7 +53,7 @@ def get_argparse():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default='pacs', choices=['pacs'], help='Name of dataset')
     parser.add_argument("--model", type=str, default='clip_moe',
-                        choices=['resnet18', 'resnet50', 'clip', 'clip_moe', 'clip_moe_layers'], help='model name')
+                        choices=['resnet18', 'resnet50', 'clip', 'clip_moe', 'clip_moe_style'], help='model name')
     parser.add_argument("--test_domain", type=str, default='p',
                         choices=['p', 'a', 'c', 's'], help='the domain name for testing')
     parser.add_argument('--num_classes', help='number of classes default 65', type=int, default=7)
@@ -77,8 +85,27 @@ def get_argparse():
     parser.add_argument('--no_normalize_features', help='Disable feature normalization by std dev', action='store_false', dest='normalize_features')
     parser.add_argument('--use_prior', help='Use weight_dict as prior distribution for similarities', action='store_true')
     parser.add_argument('--prior_strength', help='Strength of the prior distribution (higher values give more weight to prior)', type=float, default=1.0)
+    # parser.add_argument('--expert_rank', type=int, default=8, help='expert rank for the MoE layer')
+    # +++ START OF NEW CODE +++
+    
+    # --- Disentanglement Boundary Arguments (Idea A) ---
+    parser.add_argument('--private_blocks_count', type=int, default=4, help='Number of transformer blocks to keep private (style).')
 
+    # --- Adversarial Disentanglement Arguments (Idea F) ---
+    parser.add_argument('--do_adversarial', action='store_true', help='Enable adversarial disentanglement loss.')
+    parser.add_argument('--adv_lambda', type=float, default=0.1, help='Weight for the adversarial loss.')
+
+    # --- Orthogonality Regularization Arguments (Idea G) ---
+    parser.add_argument('--do_ortho', action='store_true', help='Enable orthogonality regularization loss.')
+    parser.add_argument('--ortho_lambda', type=float, default=0.05, help='Weight for the orthogonality loss.')
+
+    # --- Information Bottleneck Arguments (Idea H) ---
+    parser.add_argument('--do_bottleneck', action='store_true', help='Enable information bottleneck on the private trunk.')
+    parser.add_argument('--beta', type=float, default=1e-5, help='Weight for the KL divergence loss of the bottleneck.')
+    
+    # +++ END OF NEW CODE +++
     # misc args
+    parser.add_argument('--aux_loss_weight', type=float, default=0.01, help='Weight for the MoE auxiliary loss. Set to 0 to disable.')
     parser.add_argument('--note', help='note of experimental settings', type=str, default='feddg_moe')
     parser.add_argument('--display', help='display in controller', action='store_true')
     return parser.parse_args()
@@ -91,7 +118,16 @@ def main():
     log_ten = SummaryWriter(log_dir=tensorboard_dir)
     log_file = Get_Logger(file_name=log_dir + 'train.log', display=args.display)
     Save_Hyperparameter(log_dir, args)
-    
+    # +++ START OF NEW CODE +++
+    # --- Print the full argument list to the log file and console ---
+    log_file.info("----------------- Training Arguments -----------------")
+    print("----------------- Training Arguments -----------------")
+    for arg, value in sorted(vars(args).items()):
+        log_file.info(f"{arg}: {value}")
+        print(f"{arg}: {value}")
+    log_file.info("----------------------------------------------------")
+    print("----------------------------------------------------")
+    # +++ END OF NEW CODE +++    
     '''dataset and dataloader'''
     dataobj = PACS_FedDG(test_domain=args.test_domain, batch_size=args.batch_size, test_batch_size=args.test_batch_size)
     dataloader_dict, dataset_dict = dataobj.GetData()
@@ -108,27 +144,35 @@ def main():
     if args.domain_tracker == 'online_gaussian':
         domain_stats = OnlineGaussianTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
         log_file.info('Using Online Gaussian Tracker')
+        print('Using Online Gaussian Tracker')
     elif args.domain_tracker == 'offline_cosine_muvar':
         domain_stats = OfflineCosineMuVarTracker(args)
         log_file.info('Using Offline Cosine MuVar Tracker')
+        print('Using Offline Cosine MuVar Tracker')
     elif args.domain_tracker == 'offline_cosine_concat':
         domain_stats = OfflineCosineConcat(args)
         log_file.info('Using Offline Cosine Concat Tracker')
+        print('Using Offline Cosine Concat Tracker')
     elif args.domain_tracker == 'online_cosine':
         domain_stats = OnlineCosineTracker(num_domains=len(dataobj.train_domain_list))
         log_file.info('Using Online Cosine Tracker')
+        print('Using Online Cosine Tracker')
     elif args.domain_tracker == 'online_gmm':
         domain_stats = OnlineGMMTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
         log_file.info('Using Online GMM Tracker')
+        print('Using Online GMM Tracker')
     elif args.domain_tracker == 'offline_gmm':
         domain_stats = OfflineGMMTracker(args)
         log_file.info(f'Using Offline GMM Tracker with {args.gmm_num_components} components and {args.gmm_covariance_type} covariance')
+        print(f'Using Offline GMM Tracker with {args.gmm_num_components} components and {args.gmm_covariance_type} covariance')
     elif args.domain_tracker == 'offline_mahalanobis':
         domain_stats = OfflineMahalanobisTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
         log_file.info('Using Offline Mahalanobis Tracker')
+        print('Using Offline Mahalanobis Tracker')
     elif args.domain_tracker == 'offline_cosine':
         domain_stats = OfflineCosineTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
         log_file.info('Using Offline Cosine Tracker')
+        print('Using Offline Cosine Tracker')
     else:
         raise ValueError(f"Unknown domain tracker: {args.domain_tracker}")
 
@@ -139,35 +183,43 @@ def main():
 
     FedUpdate(model_dict, global_model)
     best_val = 0.
-    for i in range(args.comm+1):
-        FedUpdate(model_dict, global_model)
-        for domain_id, domain_name in enumerate(dataobj.train_domain_list):
-            # Train Domain[i]
-            feddgmoe_site_train(i, domain_name, args, model_dict[domain_name], optimizer_dict[domain_name], 
-                      scheduler_dict[domain_name], dataloader_dict[domain_name]['train'], log_ten, metric)
-            
-            # Update Domain [i] Statistics
-            collect_stats(model_dict[domain_name][0], dataloader_dict[domain_name]['train'], domain_stats, domain_id, args)
+    for i in range(args.comm + 1):
+        # 1. Distribution: Send global shared params to all clients
+        if i > 0: # No distribution on the first round
+            global_shared_params = global_model.get_shared_params()
+            for domain_name in dataobj.train_domain_list:
+                model_dict[domain_name].load_shared_params(global_shared_params)
 
-            # Val Domain[i]
+        # 2. Local Training and Stats Collection
+        for domain_id, domain_name in enumerate(dataobj.train_domain_list):
+            feddgmoe_site_train(i, domain_name, args, model_dict[domain_name], optimizer_dict[domain_name], 
+                      scheduler_dict[domain_name], dataloader_dict[domain_name]['train'], log_ten, metric, domain_id)
+            
+            collect_stats(model_dict[domain_name], dataloader_dict[domain_name]['train'], domain_stats, domain_id, args)
+            
+            # Optional: You can still evaluate the performance of each full client model
             site_evaluation(i, domain_name, args, model_dict[domain_name], dataloader_dict[domain_name]['val'], log_file, log_ten, metric, note='before_fed')
 
-        FedAvg(model_dict, weight_dict, global_model)
+        # 3. Aggregation: Collect shared params and average them into the global model
+        client_shared_params = [model_dict[name].get_shared_params() for name in dataobj.train_domain_list]
+        client_weights = [weight_dict[name] for name in dataobj.train_domain_list]
+        global_avg_shared_params = FedAvg(client_shared_params, client_weights)
+        global_model.load_shared_params(global_avg_shared_params)
         
+        # 4. Validation of the new global model
         fed_val = 0.
         for domain_name in dataobj.train_domain_list:
             results_dict = site_evaluation(i, domain_name, args, global_model, dataloader_dict[domain_name]['val'], log_file, log_ten, metric)
-            fed_val+= results_dict['acc']*weight_dict[domain_name]
-        # val
+            fed_val += results_dict['acc'] * weight_dict[domain_name]
+        
         if fed_val >= best_val:
-            best_val = fed_val
+            # ... (Saving checkpoints logic is fine, but save global_model)
             SaveCheckPoint(args, global_model, args.comm, os.path.join(log_dir, 'checkpoints'), note='best_val_model')
-            for domain_name in dataobj.train_domain_list: 
-                SaveCheckPoint(args, model_dict[domain_name], args.comm, os.path.join(log_dir, 'checkpoints'), note=f'best_val_{domain_name}_model')
-                
-            log_file.info(f'Model saved! Best Val Acc: {best_val*100:.2f}%')
-    
-        feddgmoe_testsite_eval(i, args.test_domain, args, global_model, dataloader_dict[args.test_domain]['test'], 
+            log_file.info(f'Global model saved! Best Val Acc: {best_val*100:.2f}%')
+            print(f'Global model saved! Best Val Acc: {best_val*100:.2f}%')
+
+        # 5. Test using the new hybrid evaluation function
+        FedTune_testsite_eval(i, args.test_domain, args, global_model, dataloader_dict[args.test_domain]['test'], 
                          log_file, log_ten, metric, note='test_domain', model_dict=model_dict, domain_stats=domain_stats,
                          weight_dict=weight_dict)
         

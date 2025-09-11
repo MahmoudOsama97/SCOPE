@@ -25,6 +25,11 @@ datasets/
 venv/
 env/
 ENV/
+datasets/
+exps/
+*.err
+*.out
+*.zip
 
 # IDE
 .idea/

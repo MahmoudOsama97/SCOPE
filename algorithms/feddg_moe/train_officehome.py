@@ -85,8 +85,27 @@ def get_argparse():
     parser.add_argument('--no_normalize_features', help='Disable feature normalization by std dev', action='store_false', dest='normalize_features')
     parser.add_argument('--use_prior', help='Use weight_dict as prior distribution for similarities', action='store_true')
     parser.add_argument('--prior_strength', help='Strength of the prior distribution (higher values give more weight to prior)', type=float, default=1.0)
+    # parser.add_argument('--expert_rank', type=int, default=8, help='expert rank for the MoE layer')
+    # +++ START OF NEW CODE +++
+    
+    # --- Disentanglement Boundary Arguments (Idea A) ---
+    parser.add_argument('--private_blocks_count', type=int, default=4, help='Number of transformer blocks to keep private (style).')
 
+    # --- Adversarial Disentanglement Arguments (Idea F) ---
+    parser.add_argument('--do_adversarial', action='store_true', help='Enable adversarial disentanglement loss.')
+    parser.add_argument('--adv_lambda', type=float, default=0.1, help='Weight for the adversarial loss.')
+
+    # --- Orthogonality Regularization Arguments (Idea G) ---
+    parser.add_argument('--do_ortho', action='store_true', help='Enable orthogonality regularization loss.')
+    parser.add_argument('--ortho_lambda', type=float, default=0.05, help='Weight for the orthogonality loss.')
+
+    # --- Information Bottleneck Arguments (Idea H) ---
+    parser.add_argument('--do_bottleneck', action='store_true', help='Enable information bottleneck on the private trunk.')
+    parser.add_argument('--beta', type=float, default=1e-5, help='Weight for the KL divergence loss of the bottleneck.')
+    
+    # +++ END OF NEW CODE +++
     # misc args
+    parser.add_argument('--aux_loss_weight', type=float, default=0.01, help='Weight for the MoE auxiliary loss. Set to 0 to disable.')
     parser.add_argument('--note', help='note of experimental settings', type=str, default='feddg_moe')
     parser.add_argument('--display', help='display in controller', action='store_true')
     return parser.parse_args()
@@ -99,7 +118,16 @@ def main():
     log_ten = SummaryWriter(log_dir=tensorboard_dir)
     log_file = Get_Logger(file_name=log_dir + 'train.log', display=args.display)
     Save_Hyperparameter(log_dir, args)
-    
+    # +++ START OF NEW CODE +++
+    # --- Print the full argument list to the log file and console ---
+    log_file.info("----------------- Training Arguments -----------------")
+    print("----------------- Training Arguments -----------------")
+    for arg, value in sorted(vars(args).items()):
+        log_file.info(f"{arg}: {value}")
+        print(f"{arg}: {value}")
+    log_file.info("----------------------------------------------------")
+    print("----------------------------------------------------")
+    # +++ END OF NEW CODE +++    
     '''dataset and dataloader'''
     dataobj = OfficeHome_FedDG(test_domain=args.test_domain, batch_size=args.batch_size, test_batch_size=args.test_batch_size)
     dataloader_dict, dataset_dict = dataobj.GetData()
@@ -116,27 +144,35 @@ def main():
     if args.domain_tracker == 'online_gaussian':
         domain_stats = OnlineGaussianTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
         log_file.info('Using Online Gaussian Tracker')
+        print('Using Online Gaussian Tracker')
     elif args.domain_tracker == 'offline_cosine_muvar':
         domain_stats = OfflineCosineMuVarTracker(args)
         log_file.info('Using Offline Cosine MuVar Tracker')
+        print('Using Offline Cosine MuVar Tracker')
     elif args.domain_tracker == 'offline_cosine_concat':
         domain_stats = OfflineCosineConcat(args)
         log_file.info('Using Offline Cosine Concat Tracker')
+        print('Using Offline Cosine Concat Tracker')
     elif args.domain_tracker == 'online_cosine':
         domain_stats = OnlineCosineTracker(num_domains=len(dataobj.train_domain_list))
         log_file.info('Using Online Cosine Tracker')
+        print('Using Online Cosine Tracker')
     elif args.domain_tracker == 'online_gmm':
         domain_stats = OnlineGMMTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
         log_file.info('Using Online GMM Tracker')
+        print('Using Online GMM Tracker')
     elif args.domain_tracker == 'offline_gmm':
         domain_stats = OfflineGMMTracker(args)
         log_file.info(f'Using Offline GMM Tracker with {args.gmm_num_components} components and {args.gmm_covariance_type} covariance')
+        print(f'Using Offline GMM Tracker with {args.gmm_num_components} components and {args.gmm_covariance_type} covariance')
     elif args.domain_tracker == 'offline_mahalanobis':
         domain_stats = OfflineMahalanobisTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
         log_file.info('Using Offline Mahalanobis Tracker')
+        print('Using Offline Mahalanobis Tracker')
     elif args.domain_tracker == 'offline_cosine':
         domain_stats = OfflineCosineTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
         log_file.info('Using Offline Cosine Tracker')
+        print('Using Offline Cosine Tracker')
     else:
         raise ValueError(f"Unknown domain tracker: {args.domain_tracker}")
 
@@ -157,7 +193,7 @@ def main():
         # 2. Local Training and Stats Collection
         for domain_id, domain_name in enumerate(dataobj.train_domain_list):
             feddgmoe_site_train(i, domain_name, args, model_dict[domain_name], optimizer_dict[domain_name], 
-                      scheduler_dict[domain_name], dataloader_dict[domain_name]['train'], log_ten, metric)
+                      scheduler_dict[domain_name], dataloader_dict[domain_name]['train'], log_ten, metric, domain_id)
             
             collect_stats(model_dict[domain_name], dataloader_dict[domain_name]['train'], domain_stats, domain_id, args)
             
@@ -180,6 +216,7 @@ def main():
             # ... (Saving checkpoints logic is fine, but save global_model)
             SaveCheckPoint(args, global_model, args.comm, os.path.join(log_dir, 'checkpoints'), note='best_val_model')
             log_file.info(f'Global model saved! Best Val Acc: {best_val*100:.2f}%')
+            print(f'Global model saved! Best Val Acc: {best_val*100:.2f}%')
 
         # 5. Test using the new hybrid evaluation function
         FedTune_testsite_eval(i, args.test_domain, args, global_model, dataloader_dict[args.test_domain]['test'], 

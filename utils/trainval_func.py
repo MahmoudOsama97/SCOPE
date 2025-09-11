@@ -8,7 +8,10 @@ import random
 from network.get_network import feats_extractor
 import copy
 from utils.fed_merge import FedAvg
-
+# --- START OF MODIFIED LINE ---
+# Import the GRL class from where it is defined
+from network.get_network import GetNetwork, feats_extractor, GradientReversalLayerFn
+# --- END OF MODIFIED LINE ---
 def Shuffle_Batch_Data(data_in):
     len_total = len(data_in)
     idx_list = list(range(len_total))
@@ -44,12 +47,22 @@ def site_evaluation(epochs, site_name, args, model, dataloader, log_file, log_te
     with torch.no_grad():
         for imgs, labels, domain_labels, in dataloader:
             imgs = imgs.cuda()
-            output = model(imgs)
+            
+            # +++ START OF FIX +++
+            # Handle conditional tuple output from the model
+            model_output = model(imgs)
+            if isinstance(model_output, tuple):
+                output = model_output[0]  # For evaluation, we only need the main logits
+            else:
+                output = model_output
+            # +++ END OF FIX +++
+
             metric.update(output, labels)
     results_dict = metric.results()
     log_ten.add_scalar(f'{note}_{site_name}_loss', results_dict['loss'], epochs)
     log_ten.add_scalar(f'{note}_{site_name}_acc', results_dict['acc'], epochs)
     log_file.info(f'{note} Round: {epochs:3d} | Epochs: {args.local_epochs*epochs:3d} | Domain: {site_name} | loss: {results_dict["loss"]:.4f} | Acc: {results_dict["acc"]*100:.2f}%')
+    print(f'{note} Round: {epochs:3d} | Epochs: {args.local_epochs*epochs:3d} | Domain: {site_name} | loss: {results_dict["loss"]:.4f} | Acc: {results_dict["acc"]*100:.2f}%')
 
     return results_dict
 
@@ -65,7 +78,7 @@ def site_evaluation_class_level(epochs, site_name, args, model, dataloader, log_
     log_ten.add_scalar(f'{note}_{site_name}_acc', results_dict['acc'], epochs)
     log_ten.add_scalar(f'{note}_{site_name}_class_acc', results_dict['class_level_acc'], epochs)
     log_file.info(f'{note} Round: {epochs:3d} | Epochs: {args.local_epochs*epochs:3d} | Domain: {site_name} | loss: {results_dict["loss"]:.4f} | Acc: {results_dict["acc"]*100:.2f}% | C Acc: {results_dict["class_level_acc"]*100:.2f}%')
-
+    print(f'{note} Round: {epochs:3d} | Epochs: {args.local_epochs*epochs:3d} | Domain: {site_name} | loss: {results_dict["loss"]:.4f} | Acc: {results_dict["acc"]*100:.2f}% | C Acc: {results_dict["class_level_acc"]*100:.2f}%')
     return results_dict
 
 def site_only_evaluation(model, dataloader, metric):
@@ -79,35 +92,74 @@ def site_only_evaluation(model, dataloader, metric):
     return results_dict
 
 
-def feddgmoe_site_train(comm_rounds, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric):
+def feddgmoe_site_train(comm_rounds, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id):
     tbar = tqdm(range(args.local_epochs))
     for local_epoch in tbar:
         tbar.set_description(f'{site_name}_train')
-        feddgmoe_epoch_site_train(comm_rounds*args.local_epochs + local_epoch, site_name, model, optimizer, scheduler, dataloader, log_ten, metric)
+        feddgmoe_epoch_site_train(comm_rounds*args.local_epochs + local_epoch, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id)
 
-def feddgmoe_epoch_site_train(epochs, site_name, model, optimzier, scheduler, dataloader, log_ten, metric):
+# Replace the old feddgmoe_epoch_site_train with this new version
+def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id):
     model.train()
     for i, data_list in enumerate(dataloader):
-        imgs, labels, domain_labels = data_list
+        imgs, labels, _ = data_list
         imgs = imgs.cuda()
-        labels = labels.cuda()
-        domain_labels = domain_labels.cuda()
-        optimzier.zero_grad()
-        output = model(imgs)
+        labels = labels.cuda()        
+        optimizer.zero_grad()
+        
+        # --- Flexible model output and loss calculation ---
+        model_output = model(imgs)
+        if isinstance(model_output, tuple):
+            output, p_feats, s_feats = model_output
+        else:
+            output = model_output
+
+        # 1. Standard Classification Loss
         loss = F.cross_entropy(output, labels)
-        ########### Calc Aux Loss ##############
-        loss_aux = 0
-        loss_aux_list = []
-        for n, m in model.named_modules():
-            if hasattr(m, 'aux_loss'):
-                loss_aux_list.append(m.aux_loss)
-        for layer_loss in loss_aux_list:
-            loss_aux += layer_loss
-        ########################################
-        loss += loss_aux
+        
+        # 2. MoE Auxiliary Loss (Regulated)
+        if args.aux_loss_weight > 0:
+            loss_aux = 0
+            for n, m in model.named_modules():
+                if hasattr(m, 'aux_loss'):
+                    # Check for stability before adding
+                    if not torch.isnan(m.aux_loss) and not torch.isinf(m.aux_loss):
+                        loss_aux += m.aux_loss
+            
+            # Add the weighted, stable aux loss
+            loss += args.aux_loss_weight * loss_aux
+        # +++ END OF MODIFIED AUX LOSS LOGIC +++
+
+        # 3. Conditional Adversarial Loss (Idea F)
+        if args.do_adversarial:
+            # +++ START OF FIX +++
+            # Create the correct labels on the fly using the local domain_id
+            batch_size = s_feats.shape[0]
+            correct_domain_labels = torch.full((batch_size,), fill_value=domain_id, dtype=torch.long, device=s_feats.device)
+            # +++ END OF FIX +++
+
+            reversed_shared_features = GradientReversalLayerFn.apply(s_feats, args.adv_lambda)
+            domain_pred = model.domain_discriminator(reversed_shared_features)
+            
+            # Use the correct labels for the loss
+            loss_dom = F.cross_entropy(domain_pred, correct_domain_labels)
+            loss += loss_dom
+
+        # 4. Conditional Orthogonality Loss (Idea G)
+        if args.do_ortho:
+            p_feats = F.normalize(p_feats, p=2, dim=1)
+            s_feats = F.normalize(s_feats, p=2, dim=1)
+            ortho_loss = torch.mean((p_feats * s_feats).sum(dim=1).pow(2))
+            loss += args.ortho_lambda * ortho_loss
+
+        # 5. Conditional Bottleneck Loss (Idea H)
+        if args.do_bottleneck and hasattr(model, 'bottleneck'):
+            loss += args.beta * model.bottleneck.kl_loss
+            
         loss.backward()
-        optimzier.step()
-        log_ten.add_scalar(f'{site_name}_train_loss', loss.item(), epochs*len(dataloader)+i)
+        optimizer.step()
+
+        log_ten.add_scalar(f'{site_name}_train_loss', loss.item(), epochs * len(dataloader) + i)
         metric.update(output, labels)
     
     log_ten.add_scalar(f'{site_name}_train_acc', metric.results()['acc'], epochs)
@@ -156,55 +208,54 @@ def GetFedModel(args, num_classes, is_train=True):
 def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log_file, log_ten, metric, note='after_fed', model_dict=None, domain_stats=None, weight_dict=None):
     """
     Test-time evaluation for Fed-Tune.
-    Dynamically builds a hybrid model for each batch by blending the best
-    private "style" trunks and fusing them with the global "content" trunk.
+    Temporarily modifies the global model's private trunk for each batch and
+    restores it, avoiding deepcopy to preserve hooks.
     """
     global_model.eval()
     
-    # Create a deepcopy of the global model to use as a template
-    hybrid_model = copy.deepcopy(global_model)
+    # --- Get the private blocks from the global model once ---
+    private_blocks_count = global_model.private_blocks_count
+    private_blocks_module = global_model.model[0].blocks[:private_blocks_count]
 
     with torch.no_grad():
         for imgs, labels, domain_labels, in tqdm(dataloader):
             imgs = imgs.cuda()
             
-            # 1. Get similarities (same as before)
-            # This uses the global model's featurizer to maintain consistency
-            # 1. Get similarities
-            # --- MODIFIED LINE: Pass the featurizer part of the global_model ---
-            # global_model.model[0] is the featurizer from the wrapped global model
-            intermediate_features = feats_extractor(imgs, global_model.model[0], avg_tokens=args.avg_tokens, num_layers=args.num_layers)
-            # --- END OF MODIFIED LINE ---
+            # --- Save the original state of the private blocks ---
+            original_private_state = {k: v.clone() for k, v in private_blocks_module.state_dict().items()}
 
-            similarities = domain_stats.get_domain_weights(intermediate_features)
-            batch_similarities = F.softmax(torch.mean(similarities, dim=0) * args.inv_temp, dim=0)
+            try:
+                # 1. Get similarities using the unmodified global model
+                intermediate_features = feats_extractor(imgs, global_model.model[0], avg_tokens=args.avg_tokens, num_layers=args.num_layers)
+                similarities = domain_stats.get_domain_weights(intermediate_features)
+                batch_similarities = F.softmax(torch.mean(similarities, dim=0) * args.inv_temp, dim=0)
 
-            # 2. Dynamically build a new private trunk via weighted average
+                # 2. Dynamically build and load the new private trunk state
+                avg_private_trunk_state = FedAvg(
+                    [model_dict[name].model[0].blocks[:private_blocks_count].state_dict() for name in args.site_list],
+                    batch_similarities.tolist()
+                )
+                private_blocks_module.load_state_dict(avg_private_trunk_state)
 
-            # --- START OF MODIFIED CODE ---
-            # Access private_blocks_count from the wrapper object directly
-            private_blocks_count = global_model.private_blocks_count
-            
-            # Use this correct count for slicing
-            avg_private_trunk_state = FedAvg(
-                [model_dict[name].model[0].blocks[:private_blocks_count].state_dict() for name in args.site_list],
-                batch_similarities.tolist()
-            )
-            
-            # Correctly load the state into the hybrid model's private blocks
-            hybrid_model.model[0].blocks[:private_blocks_count].load_state_dict(avg_private_trunk_state)
-            # --- END OF MODIFIED CODE ---
-            
-            # 3. The shared trunk and head are already the global ones from the deepcopy.
-            # Now, predict with the assembled hybrid model.
-            out = hybrid_model(imgs)
-            metric.update(out, labels)
+                # 3. Predict with the temporarily modified global_model (which still has hooks)
+                model_output = global_model(imgs)
+                if isinstance(model_output, tuple):
+                    out = model_output[0]
+                else:
+                    out = model_output
+                
+                metric.update(out, labels)
+
+            finally:
+                # --- CRUCIAL: Restore the original private blocks state ---
+                private_blocks_module.load_state_dict(original_private_state)
             
     results_dict = metric.results()
     log_ten.add_scalar(f'{note}_{site_name}_loss', results_dict['loss'], epochs)
     log_ten.add_scalar(f'{note}_{site_name}_acc', results_dict['acc'], epochs)
     log_file.info(f'{note} Round: {epochs:3d} | Domain: {site_name} | loss: {results_dict["loss"]:.4f} | Acc: {results_dict["acc"]*100:.2f}%')
-    
+    print(f'{note} Round: {epochs:3d} | Domain: {site_name} | loss: {results_dict["loss"]:.4f} | Acc: {results_dict["acc"]*100:.2f}%')
+
     return results_dict
 
 # +++ END OF NEW FUNCTION +++
@@ -278,6 +329,7 @@ def feddgmoe_testsite_eval(epochs, site_name, args, model, dataloader, log_file,
             # Optional logging of similarities
             if args.log_similarities:
                 log_file.info(f'{note}_{site_name}_batch_similarities: {batch_similarities} (epoch {epochs})')
+                print(f'{note}_{site_name}_batch_similarities: {batch_similarities} (epoch {epochs})')
                 
             # Update model parameters based on similarities
             for name, param in model.named_parameters():
@@ -292,6 +344,7 @@ def feddgmoe_testsite_eval(epochs, site_name, args, model, dataloader, log_file,
     log_ten.add_scalar(f'{note}_{site_name}_loss', results_dict['loss'], epochs)
     log_ten.add_scalar(f'{note}_{site_name}_acc', results_dict['acc'], epochs)
     log_file.info(f'{note} Round: {epochs:3d} | Epochs: {args.local_epochs*epochs:3d} | Domain: {site_name} | loss: {results_dict["loss"]:.4f} | Acc: {results_dict["acc"]*100:.2f}%')
+    print(f'{note} Round: {epochs:3d} | Epochs: {args.local_epochs*epochs:3d} | Domain: {site_name} | loss: {results_dict["loss"]:.4f} | Acc: {results_dict["acc"]*100:.2f}%')
     
     return results_dict
 
