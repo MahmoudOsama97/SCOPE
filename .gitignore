@@ -37,7 +37,9 @@ exps/
 *.swp
 *.swo
 .DS_Store
-
+*.sh
+*.out
+*.err
 # Jupyter Notebook
 .ipynb_checkpoints
 *.ipynb

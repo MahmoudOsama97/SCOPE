@@ -10,7 +10,7 @@ from data.pacs_dataset import PACS_FedDG
 from utils.classification_metric import Classification 
 from utils.log_utils import *
 from utils.fed_merge import Cal_Weight_Dict, FedAvg, FedUpdate
-from utils.trainval_func import site_evaluation, feddgmoe_site_train, FedTune_testsite_eval, GetFedModel, SaveCheckPoint
+from utils.trainval_func import site_evaluation, feddgmoe_site_train, FedTune_testsite_eval, GetFedModel, SaveCheckPoint, print_trainable_parameters
 import torch.nn.functional as F
 from tqdm import tqdm
 import torch
@@ -54,6 +54,8 @@ def get_argparse():
     parser.add_argument("--dataset", type=str, default='pacs', choices=['pacs'], help='Name of dataset')
     parser.add_argument("--model", type=str, default='clip_moe',
                         choices=['resnet18', 'resnet50', 'clip', 'clip_moe', 'clip_moe_style'], help='model name')
+    parser.add_argument("--where", type=str, default='every_qkv',
+                        help='Where to inject the MoE layers in the transformer blocks')                        
     parser.add_argument("--test_domain", type=str, default='p',
                         choices=['p', 'a', 'c', 's'], help='the domain name for testing')
     parser.add_argument('--num_classes', help='number of classes default 65', type=int, default=7)
@@ -76,6 +78,8 @@ def get_argparse():
     parser.add_argument('--gmm_covariance_type', help='Covariance type for GMM', type=str, default='diag', 
                         choices=['full', 'tied', 'diag', 'spherical'])
     ### test time eval args
+    parser.add_argument('--tta_blend_target', type=str, default='global_private', choices=['public', 'both', 'global_private'],
+                        help='Which trunk(s) to adapt at test time. "public": adapt content, use average style. "both": adapt content and style. "global_private": adapt content, use global style.')    
     parser.add_argument('--batch_agg_type', type=str, default='pre_similarity', 
                       choices=['pre_similarity', 'post_similarity'], 
                       help='How to aggregate batch features: pre_similarity averages features before computing similarities, post_similarity computes similarities per sample then averages')
@@ -91,9 +95,13 @@ def get_argparse():
     # --- Disentanglement Boundary Arguments (Idea A) ---
     parser.add_argument('--private_blocks_count', type=int, default=4, help='Number of transformer blocks to keep private (style).')
 
-    # --- Adversarial Disentanglement Arguments (Idea F) ---
-    parser.add_argument('--do_adversarial', action='store_true', help='Enable adversarial disentanglement loss.')
-    parser.add_argument('--adv_lambda', type=float, default=0.1, help='Weight for the adversarial loss.')
+# --- Shared Trunk Adversarial (Push Away from Style) ---
+    parser.add_argument('--do_adv_shared', action='store_true', help='Enable adversarial loss on SHARED trunk to enforce domain invariance.')
+    parser.add_argument('--adv_lambda_shared', type=float, default=0.1, help='Weight for the SHARED trunk adversarial loss.')
+
+    # --- Private Trunk Adversarial (Pull Toward Style) ---
+    parser.add_argument('--do_adv_private', action='store_true', help='Enable adversarial loss on PRIVATE trunk to enforce domain specificity.')
+    parser.add_argument('--adv_lambda_private', type=float, default=0.1, help='Weight for the PRIVATE trunk adversarial loss.')
 
     # --- Orthogonality Regularization Arguments (Idea G) ---
     parser.add_argument('--do_ortho', action='store_true', help='Enable orthogonality regularization loss.')
@@ -138,7 +146,13 @@ def main():
     metric = Classification()
     global_model, model_dict, optimizer_dict, scheduler_dict = GetFedModel(args, args.num_classes)
     weight_dict = Cal_Weight_Dict(dataset_dict, site_list=dataobj.train_domain_list)
-
+    # +++ 2. ADD THE FUNCTION CALL HERE +++
+    # --- Print parameter count for one of the client models ---
+    # We only need to check one, as they all have the same architecture.
+    if dataobj.train_domain_list:
+        first_client_model = model_dict[dataobj.train_domain_list[0]]
+        print_trainable_parameters(first_client_model, log_file)
+    # +++ END OF NEW CODE +++
     ''' Domain Statistics Tracking'''
     # todo get feature level from the GetFedModel
     if args.domain_tracker == 'online_gaussian':

@@ -12,7 +12,7 @@ if slurm_tmpdir is None:
 
 log_count_path = slurm_tmpdir + '/FedDG-MoE2/exps/'
 pacs_path = slurm_tmpdir + '/FedDG-MoE2/datasets/pacs'
+terra_incognita_path = slurm_tmpdir + '/FedDG-MoE2/datasets/terra_incognita'
 officehome_path = slurm_tmpdir + '/FedDG-MoE2/datasets/OfficeHome'
 vlcs_path = slurm_tmpdir + '/FedDG-MoE2/datasets/vlcs'
-domainnet_path = slurm_tmpdir + '/FedDG-MoE2/datasets/DomainNet'
-terrainc_path = ''
+domain_net_path = slurm_tmpdir + '/FedDG-MoE2/datasets/domain_net'

@@ -25,6 +25,7 @@ echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
 
 # Move the code to the compute node
 cp -r /scratch/st-msheha02-1/mosama97/FedDG-MoE2 $SLURM_TMPDIR
+# cp -r /scratch/st-msheha02-1/mosama97/datasets/pacs90.zip $SLURM_TMPDIR/FedDG-MoE2/datasets
 
 echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
 
@@ -42,6 +43,7 @@ export WANDB_MODE=offline
 # Force Hugging Face and Timm to work offline and not attempt any network connection
 export TRANSFORMERS_OFFLINE=1
 cd $SLURM_TMPDIR/FedDG-MoE2/datasets
+# mv pacs90.zip pacs.zip
 unzip OfficeHome.zip
 cd $SLURM_TMPDIR/FedDG-MoE2/
 echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
@@ -61,12 +63,16 @@ for domain in "${domains[@]}"; do
         --local_epochs 10 \
         --comm 20 \
         --private_blocks_count 4 \
-        --do_bottleneck \
+        --do_adv_private \
+        --do_adv_shared \
         --do_ortho  \
-        --note "Combo_orth_Bottleneck"
+        --do_bottleneck \
+        --adv_lambda_private 0.3 \
+        --tta_blend_target global_private \
+        --note "baseline_all"
 done
 
-python3 analyze_logs.py --output_folder ./exps --note "Combo_orth_Bottleneck"
+python3 analyze_logs.py --output_folder ./exps --note "baseline_all"
 
 cp -r $SLURM_TMPDIR/FedDG-MoE2/exps/. /scratch/st-msheha02-1/mosama97/output/
 echo "----------------------------------------"

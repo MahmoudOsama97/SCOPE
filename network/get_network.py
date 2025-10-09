@@ -87,9 +87,13 @@ class FedWrapper(nn.Module):
         if self.args.do_bottleneck:
             self.bottleneck = Bottleneck(self.featurizer.num_features)
         
-        if self.args.do_adversarial:
-            num_domains = len(self.args.site_list)
-            self.domain_discriminator = DomainDiscriminator(self.featurizer.num_features, num_domains)
+        num_domains = len(self.args.site_list)
+        # Create SHARED discriminator (for PUSH logic)
+        if self.args.do_adv_shared:
+            self.shared_domain_discriminator = DomainDiscriminator(self.featurizer.num_features, num_domains)
+        # Create PRIVATE discriminator (for PULL logic)
+        if self.args.do_adv_private:
+            self.private_domain_discriminator = DomainDiscriminator(self.featurizer.num_features, num_domains)
 
     def _create_hook(self, name):
         """Creates a hook function that saves the output of a module."""
@@ -98,6 +102,19 @@ class FedWrapper(nn.Module):
             # We are interested in the CLS token's representation.
             self.captured_features[name] = output[:, 0]
         return hook
+
+    # +++ ADD THIS NEW HELPER METHOD +++
+    def _register_hooks(self):
+        """
+        (Re)registers the forward hooks to the internal model's layers.
+        Crucial for making deepcopied instances functional.
+        """
+        if self.private_blocks_count > 0:
+            last_private_block = self.model[0].blocks[self.private_blocks_count - 1]
+            last_private_block.register_forward_hook(self._create_hook('private'))
+
+        last_shared_block = self.model[0].blocks[-1]
+        last_shared_block.register_forward_hook(self._create_hook('shared'))
 
     def forward(self, x):
         # 1. Clear previous features and run the original, proven forward pass
@@ -123,10 +140,12 @@ class FedWrapper(nn.Module):
         # 3. Final Classification
         final_output = self.classifier_head(features_pre_head)
         
-        if self.args.do_ortho or self.args.do_adversarial:
+        if self.args.do_ortho or self.args.do_adv_shared or self.args.do_adv_private:
             # Ensure we don't fail if a hook didn't run (e.g., private_blocks_count=0)
-            if private_features is None:
+            if private_features is None and shared_features is not None:
                 private_features = torch.zeros_like(shared_features)
+            
+            # This is critical for making the training loop robust
             return final_output, private_features, shared_features
         else:
             return final_output
@@ -140,20 +159,29 @@ class FedWrapper(nn.Module):
                 shared_state[f'0.blocks.{name}'] = param.data.clone()
         for name, param in self.classifier_head.named_parameters():
             shared_state[f'1.{name}'] = param.data.clone()
-        if self.args.do_adversarial and hasattr(self, 'domain_discriminator'):
-            for name, param in self.domain_discriminator.named_parameters():
-                shared_state[f'domain_discriminator.{name}'] = param.data.clone()
+        # Share the SHARED discriminator if it exists
+        if self.args.do_adv_shared and hasattr(self, 'shared_domain_discriminator'):
+            for name, param in self.shared_domain_discriminator.named_parameters():
+                shared_state[f'shared_domain_discriminator.{name}'] = param.data.clone()
+        # Share the PRIVATE discriminator if it exists
+        if self.args.do_adv_private and hasattr(self, 'private_domain_discriminator'):
+            for name, param in self.private_domain_discriminator.named_parameters():
+                shared_state[f'private_domain_discriminator.{name}'] = param.data.clone()
         return shared_state
 
     def load_shared_params(self, shared_state_dict):
         # We need to load into the base model and potentially the discriminator
         self.model.load_state_dict(shared_state_dict, strict=False)
-        if self.args.do_adversarial and hasattr(self, 'domain_discriminator'):
-            # The keys for the discriminator won't be in model, so load them separately
-            # A bit of care is needed to extract only the relevant keys.
-            disc_state = {k.replace('domain_discriminator.',''): v for k,v in shared_state_dict.items() if 'domain_discriminator' in k}
+        # Load SHARED discriminator state if it exists
+        if self.args.do_adv_shared and hasattr(self, 'shared_domain_discriminator'):
+            disc_state = {k.replace('shared_domain_discriminator.',''): v for k,v in shared_state_dict.items() if 'shared_domain_discriminator' in k}
             if disc_state:
-                 self.domain_discriminator.load_state_dict(disc_state, strict=False)
+                 self.shared_domain_discriminator.load_state_dict(disc_state, strict=False)
+        # Load PRIVATE discriminator state if it exists
+        if self.args.do_adv_private and hasattr(self, 'private_domain_discriminator'):
+            disc_state = {k.replace('private_domain_discriminator.',''): v for k,v in shared_state_dict.items() if 'private_domain_discriminator' in k}
+            if disc_state:
+                 self.private_domain_discriminator.load_state_dict(disc_state, strict=False)
 def my_get_intermediate_layers(
         featurizer,
         x: torch.Tensor,
@@ -353,7 +381,7 @@ def GetNetwork(args, num_classes, pretrained=True, **kwargs):
             param.requires_grad = False
         # expert_rank = args.expert_rank
         # inject_trainable_moe_kronecker_new(featurizer, r=[1, 2, 4, 8], where='every_qkv', expert_rank=expert_rank)
-        inject_trainable_moe_kronecker_new(featurizer, r=[1, 2, 4, 8], where='every_qkv')
+        inject_trainable_moe_kronecker_new(featurizer, r=[1, 2, 4, 8], where=args.where)
 
         classifier = nn.Linear(feature_level, num_classes)
         model = nn.Sequential(featurizer, classifier)
@@ -390,7 +418,7 @@ def GetNetwork(args, num_classes, pretrained=True, **kwargs):
             param.requires_grad = False
         # expert_rank = args.expert_rank
         # inject_trainable_moe_kronecker_new(featurizer, r=[1, 2, 4, 8], where='every_qkv', expert_rank=expert_rank)
-        inject_trainable_moe_kronecker_new(featurizer, r=[1, 2, 4, 8], where='every_qkv')
+        inject_trainable_moe_kronecker_new(featurizer, r=[1, 2, 4, 8], where=args.where)
         classifier = nn.Linear(feature_level, num_classes)
 
         sequential_model = nn.Sequential(featurizer, classifier)

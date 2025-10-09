@@ -129,21 +129,34 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
             # Add the weighted, stable aux loss
             loss += args.aux_loss_weight * loss_aux
         # +++ END OF MODIFIED AUX LOSS LOGIC +++
-
-        # 3. Conditional Adversarial Loss (Idea F)
-        if args.do_adversarial:
             # +++ START OF FIX +++
             # Create the correct labels on the fly using the local domain_id
             batch_size = s_feats.shape[0]
             correct_domain_labels = torch.full((batch_size,), fill_value=domain_id, dtype=torch.long, device=s_feats.device)
             # +++ END OF FIX +++
-
-            reversed_shared_features = GradientReversalLayerFn.apply(s_feats, args.adv_lambda)
-            domain_pred = model.domain_discriminator(reversed_shared_features)
+        # 3. SHARED Trunk Adversarial Loss (PUSH away from style)
+        if args.do_adv_shared and hasattr(model, 'shared_domain_discriminator'):
+            # --- MOVED LOGIC HERE ---
+            batch_size = s_feats.shape[0]
+            correct_domain_labels = torch.full((batch_size,), fill_value=domain_id, dtype=torch.long, device=s_feats.device)
+            # --- END MOVED LOGIC ---
             
-            # Use the correct labels for the loss
-            loss_dom = F.cross_entropy(domain_pred, correct_domain_labels)
-            loss += loss_dom
+            reversed_shared_features = GradientReversalLayerFn.apply(s_feats, args.adv_lambda_shared)
+            domain_pred = model.shared_domain_discriminator(reversed_shared_features)
+            loss_dom_shared = F.cross_entropy(domain_pred, correct_domain_labels)
+            loss += loss_dom_shared
+
+        # 4. PRIVATE Trunk Adversarial Loss (PULL toward style)
+        if args.do_adv_private and hasattr(model, 'private_domain_discriminator'):
+            # --- MOVED LOGIC HERE ---
+            batch_size = p_feats.shape[0]
+            correct_domain_labels = torch.full((batch_size,), fill_value=domain_id, dtype=torch.long, device=p_feats.device)
+            # --- END MOVED LOGIC ---
+
+            # NO Gradient Reversal Layer here. The goal is to help the discriminator.
+            domain_pred = model.private_domain_discriminator(p_feats)
+            loss_dom_private = F.cross_entropy(domain_pred, correct_domain_labels)
+            loss += args.adv_lambda_private * loss_dom_private
 
         # 4. Conditional Orthogonality Loss (Idea G)
         if args.do_ortho:
@@ -178,7 +191,7 @@ def GetFedModel(args, num_classes, is_train=True):
         domain_list = officehome_domain_list
     elif args.dataset == 'domainNet':
         domain_list = domainNet_domain_list
-    elif args.dataset == 'terrainc':
+    elif args.dataset == 'TerraIncognita':
         domain_list = terra_incognita_list
     elif args.dataset == 'vlcs':
         domain_list = vlcs_domain_list
@@ -207,48 +220,64 @@ def GetFedModel(args, num_classes, is_train=True):
 
 def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log_file, log_ten, metric, note='after_fed', model_dict=None, domain_stats=None, weight_dict=None):
     """
-    Test-time evaluation for Fed-Tune.
-    Temporarily modifies the global model's private trunk for each batch and
-    restores it, avoiding deepcopy to preserve hooks.
+    Test-time evaluation with three strategies: 'public', 'both', or 'global_private'.
     """
     global_model.eval()
-    
-    # --- Get the private blocks from the global model once ---
-    private_blocks_count = global_model.private_blocks_count
-    private_blocks_module = global_model.model[0].blocks[:private_blocks_count]
+
+    # --- Pre-compute the "neutral average" private trunk state if needed ---
+    avg_private_state = None
+    if args.tta_blend_target == 'public':
+        private_blocks_count = global_model.private_blocks_count
+        all_private_states = [model_dict[name].model[0].blocks[:private_blocks_count].state_dict() for name in args.site_list]
+        num_clients = len(args.site_list)
+        uniform_weights = [1.0 / num_clients] * num_clients
+        avg_private_state = FedAvg(all_private_states, uniform_weights)
 
     with torch.no_grad():
         for imgs, labels, domain_labels, in tqdm(dataloader):
             imgs = imgs.cuda()
+
+            hybrid_model = copy.deepcopy(global_model)
+            hybrid_model._register_hooks()
+
+            # 1. Get similarities (standard for all options)
+            intermediate_features = feats_extractor(imgs, global_model.model[0], avg_tokens=args.avg_tokens, num_layers=args.num_layers)
+            similarities = domain_stats.get_domain_weights(intermediate_features)
+            batch_similarities = F.softmax(torch.mean(similarities, dim=0) * args.inv_temp, dim=0)
+
+            # --- 2. Execute the selected blending strategy ---
             
-            # --- Save the original state of the private blocks ---
-            original_private_state = {k: v.clone() for k, v in private_blocks_module.state_dict().items()}
+            # --- Blend the SHARED/PUBLIC part (Happens in ALL options) ---
+            shared_states = [model_dict[name].get_shared_params() for name in args.site_list]
+            blended_shared_state = FedAvg(shared_states, batch_similarities.tolist())
+            hybrid_model.load_shared_params(blended_shared_state)
 
-            try:
-                # 1. Get similarities using the unmodified global model
-                intermediate_features = feats_extractor(imgs, global_model.model[0], avg_tokens=args.avg_tokens, num_layers=args.num_layers)
-                similarities = domain_stats.get_domain_weights(intermediate_features)
-                batch_similarities = F.softmax(torch.mean(similarities, dim=0) * args.inv_temp, dim=0)
+            if args.tta_blend_target == 'both':
+                # ** OPTION 1: Also dynamically blend the PRIVATE (style) trunk **
+                private_blocks_count = hybrid_model.private_blocks_count
+                private_states = [model_dict[name].model[0].blocks[:private_blocks_count].state_dict() for name in args.site_list]
+                blended_private_state = FedAvg(private_states, batch_similarities.tolist())
+                hybrid_model.model[0].blocks[:private_blocks_count].load_state_dict(blended_private_state)
 
-                # 2. Dynamically build and load the new private trunk state
-                avg_private_trunk_state = FedAvg(
-                    [model_dict[name].model[0].blocks[:private_blocks_count].state_dict() for name in args.site_list],
-                    batch_similarities.tolist()
-                )
-                private_blocks_module.load_state_dict(avg_private_trunk_state)
+            elif args.tta_blend_target == 'public':
+                # ** OPTION 2: Use the fixed, neutral AVERAGE private trunk **
+                private_blocks_count = hybrid_model.private_blocks_count
+                hybrid_model.model[0].blocks[:private_blocks_count].load_state_dict(avg_private_state)
 
-                # 3. Predict with the temporarily modified global_model (which still has hooks)
-                model_output = global_model(imgs)
-                if isinstance(model_output, tuple):
-                    out = model_output[0]
-                else:
-                    out = model_output
-                
-                metric.update(out, labels)
+            elif args.tta_blend_target == 'global_private':
+                # ** OPTION 3 (Your Idea): Do NOTHING to the private trunk **
+                # The hybrid_model already has the private trunk from the global_model
+                # due to the deepcopy, so we just pass.
+                pass
 
-            finally:
-                # --- CRUCIAL: Restore the original private blocks state ---
-                private_blocks_module.load_state_dict(original_private_state)
+            # 3. Predict with the assembled hybrid model
+            model_output = hybrid_model(imgs)
+            if isinstance(model_output, tuple):
+                out = model_output[0]
+            else:
+                out = model_output
+            
+            metric.update(out, labels)
             
     results_dict = metric.results()
     log_ten.add_scalar(f'{note}_{site_name}_loss', results_dict['loss'], epochs)
@@ -349,3 +378,42 @@ def feddgmoe_testsite_eval(epochs, site_name, args, model, dataloader, log_file,
     return results_dict
 
 
+# +++ START OF NEW FUNCTION +++
+def print_trainable_parameters(model, log_file=None):
+    """
+    Calculates and prints the number of total and trainable parameters in a model.
+    """
+    trainable_params = 0
+    total_params = 0
+    for name, param in model.named_parameters():
+        total_params += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+
+    # Prepare the output strings
+    header = "----------------- Model Parameters -----------------"
+    line1 = f"Total parameters:     {total_params:,}"
+    line2 = f"Trainable parameters: {trainable_params:,}"
+    
+    if total_params > 0:
+        percentage = 100 * trainable_params / total_params
+        line3 = f"Trainable percentage: {percentage:.2f}%"
+    else:
+        line3 = "Trainable percentage: N/A"
+    footer = "----------------------------------------------------"
+
+    # Print to console
+    print(header)
+    print(line1)
+    print(line2)
+    print(line3)
+    print(footer)
+
+    # Log to file if a logger is provided
+    if log_file:
+        log_file.info(header)
+        log_file.info(line1)
+        log_file.info(line2)
+        log_file.info(line3)
+        log_file.info(footer)
+# +++ END OF NEW FUNCTION +++

@@ -49,9 +49,9 @@ class TerraInc_SingleDomain():
         
         if self.split == 'train' or self.split == 'val':
             random.seed(self.seed)
-            train_img, val_img = TerraInc_SingleDomain.split_list(self.imgs, 0.8)
+            train_img, val_img = TerraInc_SingleDomain.split_list(self.imgs, 0.9)
             random.seed(self.seed)
-            train_label, val_label = TerraInc_SingleDomain.split_list(self.labels, 0.8)
+            train_label, val_label = TerraInc_SingleDomain.split_list(self.labels, 0.9)
             if self.split == 'train':
                 self.imgs, self.labels = train_img, train_label
             elif self.split == 'val':
@@ -84,8 +84,9 @@ class TerraInc_SingleDomain():
         return imgs, labels
     
 class TerraInc_FedDG():
-    def __init__(self, test_domain='100', batch_size=64, seed=0):
+    def __init__(self, test_domain='100', batch_size=64, test_batch_size=8, seed=0):
         self.batch_size = batch_size
+        self.test_batch_size = test_batch_size
         self.domain_list = list(terra_incognita_name_dict.keys())
         self.test_domain = test_domain
         self.train_domain_list = self.domain_list.copy()
@@ -95,7 +96,11 @@ class TerraInc_FedDG():
         self.site_dataset_dict = {}
         self.site_dataloader_dict = {}
         for domain_name in self.domain_list:
-            self.site_dataloader_dict[domain_name], self.site_dataset_dict[domain_name] = TerraInc_FedDG.SingleSite(domain_name, self.batch_size, self.seed)
+            self.site_dataloader_dict[domain_name], self.site_dataset_dict[domain_name] = TerraInc_FedDG.SingleSite(
+                domain_name, 
+                self.batch_size, 
+                self.test_batch_size if domain_name == self.test_domain else self.batch_size,
+                self.seed)
             
         
         self.test_dataset = self.site_dataset_dict[self.test_domain]['test']
@@ -103,13 +108,17 @@ class TerraInc_FedDG():
         
           
     @staticmethod
-    def SingleSite(domain_name, batch_size=64, seed=0):
+    def SingleSite(domain_name, batch_size=64, test_batch_size=8, seed=0):
         dataset_dict = {
             'train': TerraInc_SingleDomain(domain_name=domain_name, split='train', train_transform=transform_train, seed=seed).dataset,
             'val': TerraInc_SingleDomain(domain_name=domain_name, split='val', seed=seed).dataset,
             'test': TerraInc_SingleDomain(domain_name=domain_name, split='test', seed=seed).dataset,
         }
-        dataloader_dict = GetDataLoaderDict(dataset_dict, batch_size)
+        dataloader_dict = {
+            'train': torch.utils.data.DataLoader(dataset_dict['train'], batch_size=batch_size, shuffle=True),
+            'val': torch.utils.data.DataLoader(dataset_dict['val'], batch_size=batch_size, shuffle=False),
+            'test': torch.utils.data.DataLoader(dataset_dict['test'], batch_size=test_batch_size, shuffle=False)
+        }
         return dataloader_dict, dataset_dict
         
     def GetData(self):

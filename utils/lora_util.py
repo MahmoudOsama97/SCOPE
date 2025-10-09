@@ -836,7 +836,44 @@ def inject_trainable_moe_kronecker_new(
                     names.append(name)
                     for key, value in k.items():
                         setattr(_module._modules[name], key, value)
+        elif 'ALL' in where:  # every 2
+            if where == 'ALL':
+                weight = _child_module.weight
+                bias = _child_module.bias
+                _tmp = layer(
+                    _child_module.in_features,
+                    _child_module.out_features,
+                )
+                _tmp.weight = weight
+                if bias is not None:
+                    _tmp.bias = bias
 
+                # switch the module
+                _tmp.to(_child_module.weight.device).to(_child_module.weight.dtype)
+                _module._modules[name] = _tmp
+
+                names.append(name)
+                for key, value in k.items():
+                    setattr(_module._modules[name], key, value)
+
+            elif name in where:
+                weight = _child_module.weight
+                bias = _child_module.bias
+                _tmp = layer(
+                    _child_module.in_features,
+                    _child_module.out_features,
+                )
+                _tmp.weight = weight
+                if bias is not None:
+                    _tmp.bias = bias
+
+                # switch the module
+                _tmp.to(_child_module.weight.device).to(_child_module.weight.dtype)
+                _module._modules[name] = _tmp
+
+                names.append(name)
+                for key, value in k.items():
+                    setattr(_module._modules[name], key, value)
         elif 'last' in where:
             if 19 < ii:
                 if where == 'last':
