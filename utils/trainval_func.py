@@ -108,11 +108,7 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
         optimizer.zero_grad()
         
         # --- Flexible model output and loss calculation ---
-        model_output = model(imgs)
-        if isinstance(model_output, tuple):
-            output, p_feats, s_feats = model_output
-        else:
-            output = model_output
+        output, p_feats, s_feats = model(imgs)
 
         # 1. Standard Classification Loss
         loss = F.cross_entropy(output, labels)
@@ -128,12 +124,6 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
             
             # Add the weighted, stable aux loss
             loss += args.aux_loss_weight * loss_aux
-        # +++ END OF MODIFIED AUX LOSS LOGIC +++
-            # +++ START OF FIX +++
-            # Create the correct labels on the fly using the local domain_id
-            batch_size = s_feats.shape[0]
-            correct_domain_labels = torch.full((batch_size,), fill_value=domain_id, dtype=torch.long, device=s_feats.device)
-            # +++ END OF FIX +++
         # 3. SHARED Trunk Adversarial Loss (PUSH away from style)
         if args.do_adv_shared and hasattr(model, 'shared_domain_discriminator'):
             # --- MOVED LOGIC HERE ---
@@ -218,9 +208,9 @@ def GetFedModel(args, num_classes, is_train=True):
     return global_model, model_dict, optimizer_dict, scheduler_dict
 
 
-def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log_file, log_ten, metric, note='after_fed', model_dict=None, domain_stats=None, weight_dict=None):
+def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log_file, log_ten, metric, note='after_fed', model_dict=None, domain_stats_private=None, domain_stats_shared=None, weight_dict=None):
     """
-    Test-time evaluation with three strategies: 'public', 'both', or 'global_private'.
+    Test-time evaluation with four strategies: 'public', 'both', 'global_private', and 'disentangled'.
     """
     global_model.eval()
 
@@ -240,35 +230,55 @@ def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log
             hybrid_model = copy.deepcopy(global_model)
             hybrid_model._register_hooks()
 
-            # 1. Get similarities (standard for all options)
-            intermediate_features = feats_extractor(imgs, global_model.model[0], avg_tokens=args.avg_tokens, num_layers=args.num_layers)
-            similarities = domain_stats.get_domain_weights(intermediate_features)
-            batch_similarities = F.softmax(torch.mean(similarities, dim=0) * args.inv_temp, dim=0)
+            # --- 1. Get Similarity Weights based on the Strategy ---
+            if args.tta_blend_target == 'disentangled':
+                # D-TTA: Dual-stream similarity calculation
+                _, test_p_feats, test_s_feats = global_model(imgs)
+                
+                # A. Style Similarity
+                style_similarities = domain_stats_private.get_domain_weights(test_p_feats)
+                style_weights = F.softmax(torch.mean(style_similarities, dim=0) * args.inv_temp, dim=0)
+                
+                # B. Content Similarity
+                content_similarities = domain_stats_shared.get_domain_weights(test_s_feats)
+                content_weights = F.softmax(torch.mean(content_similarities, dim=0) * args.inv_temp, dim=0)
 
-            # --- 2. Execute the selected blending strategy ---
-            
-            # --- Blend the SHARED/PUBLIC part (Happens in ALL options) ---
-            shared_states = [model_dict[name].get_shared_params() for name in args.site_list]
-            blended_shared_state = FedAvg(shared_states, batch_similarities.tolist())
-            hybrid_model.load_shared_params(blended_shared_state)
+            else:
+                # Standard TTA: Single-stream similarity calculation for all other strategies
+                _, _, test_s_feats = global_model(imgs) # Still need shared feats for comparison
+                similarities = domain_stats_shared.get_domain_weights(test_s_feats)
+                batch_similarities = F.softmax(torch.mean(similarities, dim=0) * args.inv_temp, dim=0)
 
-            if args.tta_blend_target == 'both':
-                # ** OPTION 1: Also dynamically blend the PRIVATE (style) trunk **
+            # --- 2. Execute Blending Strategy ---
+            if args.tta_blend_target == 'disentangled':
+                # ** OPTION 4: Disentangled Blending **
                 private_blocks_count = hybrid_model.private_blocks_count
                 private_states = [model_dict[name].model[0].blocks[:private_blocks_count].state_dict() for name in args.site_list]
-                blended_private_state = FedAvg(private_states, batch_similarities.tolist())
+                blended_private_state = FedAvg(private_states, style_weights.tolist()) # Use style_weights
                 hybrid_model.model[0].blocks[:private_blocks_count].load_state_dict(blended_private_state)
+                
+                shared_states = [model_dict[name].get_shared_params() for name in args.site_list]
+                blended_shared_state = FedAvg(shared_states, content_weights.tolist()) # Use content_weights
+                hybrid_model.load_shared_params(blended_shared_state)
 
-            elif args.tta_blend_target == 'public':
-                # ** OPTION 2: Use the fixed, neutral AVERAGE private trunk **
-                private_blocks_count = hybrid_model.private_blocks_count
-                hybrid_model.model[0].blocks[:private_blocks_count].load_state_dict(avg_private_state)
+            else:
+                # --- Logic for the original three strategies ---
+                shared_states = [model_dict[name].get_shared_params() for name in args.site_list]
+                blended_shared_state = FedAvg(shared_states, batch_similarities.tolist())
+                hybrid_model.load_shared_params(blended_shared_state)
 
-            elif args.tta_blend_target == 'global_private':
-                # ** OPTION 3 (Your Idea): Do NOTHING to the private trunk **
-                # The hybrid_model already has the private trunk from the global_model
-                # due to the deepcopy, so we just pass.
-                pass
+                if args.tta_blend_target == 'both':
+                    private_blocks_count = hybrid_model.private_blocks_count
+                    private_states = [model_dict[name].model[0].blocks[:private_blocks_count].state_dict() for name in args.site_list]
+                    blended_private_state = FedAvg(private_states, batch_similarities.tolist())
+                    hybrid_model.model[0].blocks[:private_blocks_count].load_state_dict(blended_private_state)
+                
+                elif args.tta_blend_target == 'public':
+                    private_blocks_count = hybrid_model.private_blocks_count
+                    hybrid_model.model[0].blocks[:private_blocks_count].load_state_dict(avg_private_state)
+                
+                elif args.tta_blend_target == 'global_private':
+                    pass
 
             # 3. Predict with the assembled hybrid model
             model_output = hybrid_model(imgs)

@@ -9,7 +9,7 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from data.pacs_dataset import PACS_FedDG
 from utils.classification_metric import Classification 
 from utils.log_utils import *
-from utils.fed_merge import Cal_Weight_Dict, FedAvg, FedUpdate
+from utils.fed_merge import Cal_Weight_Dict, FedAvg, FedUpdate, ExpertMatchedAvg, permute_state_dict
 from utils.trainval_func import site_evaluation, feddgmoe_site_train, FedTune_testsite_eval, GetFedModel, SaveCheckPoint, print_trainable_parameters
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -23,6 +23,39 @@ from utils.domain_stats.online.online_gaussian import OnlineGaussianTracker
 from utils.domain_stats.offline.offline_gmm import OfflineGMMTracker
 from utils.domain_stats.offline.offline_mahalanobis import OfflineMahalanobisTracker
 from utils.domain_stats.offline.offline_cosine import OfflineCosineTracker, OfflineCosineMuVarTracker, OfflineCosineConcat
+from utils.lora_util import CosineTopKGate
+# Create a new helper function before main()
+def generate_expert_representations(model, prototype_input):
+    """
+    Uses hooks to capture the average router logits for a model on a fixed input.
+    These logits serve as the representation for each expert.
+    """
+    captured_logits = {}
+    hooks = []
+
+    def create_hook(name):
+        def hook(model, input, output):
+            captured_logits[name] = output.mean(dim=0).detach().cpu()
+        return hook
+
+    # Register hooks on all router modules inside the sequential model
+    for name, module in model.model.named_modules(): # <--- Search inside model.model
+        if isinstance(module, CosineTopKGate):
+            # The 'name' will now be relative to the sequential model (e.g., '0.blocks.8...')
+            hooks.append(module.register_forward_hook(create_hook(name)))
+
+    # Perform a forward pass to trigger the hooks
+    model.eval()
+    with torch.no_grad():
+        model(prototype_input.cuda())
+    model.train()
+
+    # Remove hooks to clean up
+    for h in hooks:
+        h.remove()
+        
+    return captured_logits
+
 
 def collect_online_stats(model, dataloader, domain_stats, domain_id, args):
     """
@@ -34,20 +67,38 @@ def collect_online_stats(model, dataloader, domain_stats, domain_id, args):
             features = feats_extractor(inputs.cuda(), model, avg_tokens=args.avg_tokens, num_layers=args.num_layers)
             domain_stats.update(features, domain_id)
 
-def collect_offline_stats(model, dataloader, domain_stats, domain_id, args):
+def collect_offline_stats(model, dataloader, domain_stats_private, domain_stats_shared, domain_id, args):
     """
-    Collect offline statistics for a domain. Refits from scratch.
+    Collects offline statistics robustly for ALL TTA strategies.
     """
-    all_features = []
+    all_private_features = []
+    all_shared_features = []
+    
+    # Determine if we need to collect private features based on the TTA strategy
+    needs_private_stats = (args.tta_blend_target == 'disentangled')
+
     with torch.no_grad():
         for inputs, _, _ in dataloader:
-            # --- MODIFIED LINE: Pass the featurizer part of the model ---
-            # model.model is the nn.Sequential, model.model[0] is the featurizer
-            features = feats_extractor(inputs.cuda(), model.model[0], avg_tokens=args.avg_tokens, num_layers=args.num_layers)
-            # --- END OF MODIFIED LINE ---
-            all_features.append(features)
-    all_features = torch.cat(all_features, dim=0)
-    domain_stats.refit(all_features, domain_id)  # Call the refit method
+            # The model now consistently returns a 3-part tuple
+            _, p_feats, s_feats = model(inputs.cuda())
+            
+            # Conditionally collect private features only when needed
+            if needs_private_stats:
+                if p_feats is not None:
+                    all_private_features.append(p_feats)
+            
+            # Always collect shared features, as they are needed by all TTA strategies
+            if s_feats is not None:
+                all_shared_features.append(s_feats)
+
+    # Refit the trackers with the collected features
+    if needs_private_stats and all_private_features:
+        all_private_features = torch.cat(all_private_features, dim=0)
+        domain_stats_private.refit(all_private_features, domain_id)
+    
+    if all_shared_features:
+        all_shared_features = torch.cat(all_shared_features, dim=0)
+        domain_stats_shared.refit(all_shared_features, domain_id)
 
 def get_argparse():
     parser = argparse.ArgumentParser()
@@ -66,6 +117,8 @@ def get_argparse():
     parser.add_argument('--lr', help='learning rate', type=float, default=0.001)
     parser.add_argument("--lr_policy", type=str, default='step', choices=['step'],
                         help="learning rate scheduler policy")
+    parser.add_argument('--agg_strategy', type=str, default='fedavg', choices=['fedavg', 'elma'],
+                        help='The server-side aggregation strategy to use.')
     ## tracker args
     parser.add_argument('--domain_tracker', help='Which domain stats tracker to use', type=str, default='offline_cosine_muvar',
                        choices=['offline_cosine_muvar', 'offline_cosine', 'offline_mahalanobis', 
@@ -78,8 +131,8 @@ def get_argparse():
     parser.add_argument('--gmm_covariance_type', help='Covariance type for GMM', type=str, default='diag', 
                         choices=['full', 'tied', 'diag', 'spherical'])
     ### test time eval args
-    parser.add_argument('--tta_blend_target', type=str, default='global_private', choices=['public', 'both', 'global_private'],
-                        help='Which trunk(s) to adapt at test time. "public": adapt content, use average style. "both": adapt content and style. "global_private": adapt content, use global style.')    
+    parser.add_argument('--tta_blend_target', type=str, default='global_private', choices=['public', 'both', 'global_private', 'disentangled'],
+                        help='Which trunk(s) to adapt at test time. "public": adapt content, use average style. "both": adapt content and style. "global_private": adapt content, use global style. "disentangled": dual-stream adaptation for style and content.')
     parser.add_argument('--batch_agg_type', type=str, default='pre_similarity', 
                       choices=['pre_similarity', 'post_similarity'], 
                       help='How to aggregate batch features: pre_similarity averages features before computing similarities, post_similarity computes similarities per sample then averages')
@@ -156,35 +209,43 @@ def main():
     ''' Domain Statistics Tracking'''
     # todo get feature level from the GetFedModel
     if args.domain_tracker == 'online_gaussian':
-        domain_stats = OnlineGaussianTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
+        domain_stats_private = OnlineGaussianTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
+        domain_stats_shared = OnlineGaussianTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
         log_file.info('Using Online Gaussian Tracker')
         print('Using Online Gaussian Tracker')
     elif args.domain_tracker == 'offline_cosine_muvar':
-        domain_stats = OfflineCosineMuVarTracker(args)
+        domain_stats_private = OfflineCosineMuVarTracker(args)
+        domain_stats_shared = OfflineCosineMuVarTracker(args)
         log_file.info('Using Offline Cosine MuVar Tracker')
         print('Using Offline Cosine MuVar Tracker')
     elif args.domain_tracker == 'offline_cosine_concat':
-        domain_stats = OfflineCosineConcat(args)
+        domain_stats_private = OfflineCosineConcat(args)
+        domain_stats_shared = OfflineCosineConcat(args)
         log_file.info('Using Offline Cosine Concat Tracker')
         print('Using Offline Cosine Concat Tracker')
     elif args.domain_tracker == 'online_cosine':
-        domain_stats = OnlineCosineTracker(num_domains=len(dataobj.train_domain_list))
+        domain_stats_private = OnlineCosineTracker(num_domains=len(dataobj.train_domain_list))
+        domain_stats_shared = OnlineCosineTracker(num_domains=len(dataobj.train_domain_list))        
         log_file.info('Using Online Cosine Tracker')
         print('Using Online Cosine Tracker')
     elif args.domain_tracker == 'online_gmm':
-        domain_stats = OnlineGMMTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
+        domain_stats_private = OnlineGMMTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
+        domain_stats_shared = OnlineGMMTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))         
         log_file.info('Using Online GMM Tracker')
         print('Using Online GMM Tracker')
     elif args.domain_tracker == 'offline_gmm':
-        domain_stats = OfflineGMMTracker(args)
+        domain_stats_private = OfflineGMMTracker(args)
+        domain_stats_shared = OfflineGMMTracker(args)        
         log_file.info(f'Using Offline GMM Tracker with {args.gmm_num_components} components and {args.gmm_covariance_type} covariance')
         print(f'Using Offline GMM Tracker with {args.gmm_num_components} components and {args.gmm_covariance_type} covariance')
     elif args.domain_tracker == 'offline_mahalanobis':
-        domain_stats = OfflineMahalanobisTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
+        domain_stats_private = OfflineMahalanobisTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
+        domain_stats_shared = OfflineMahalanobisTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list)) 
         log_file.info('Using Offline Mahalanobis Tracker')
         print('Using Offline Mahalanobis Tracker')
     elif args.domain_tracker == 'offline_cosine':
-        domain_stats = OfflineCosineTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
+        domain_stats_private = OfflineCosineTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
+        domain_stats_shared = OfflineCosineTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list)) 
         log_file.info('Using Offline Cosine Tracker')
         print('Using Offline Cosine Tracker')
     else:
@@ -209,7 +270,7 @@ def main():
             feddgmoe_site_train(i, domain_name, args, model_dict[domain_name], optimizer_dict[domain_name], 
                       scheduler_dict[domain_name], dataloader_dict[domain_name]['train'], log_ten, metric, domain_id)
             
-            collect_stats(model_dict[domain_name], dataloader_dict[domain_name]['train'], domain_stats, domain_id, args)
+            collect_stats(model_dict[domain_name], dataloader_dict[domain_name]['train'], domain_stats_private, domain_stats_shared, domain_id, args)
             
             # Optional: You can still evaluate the performance of each full client model
             site_evaluation(i, domain_name, args, model_dict[domain_name], dataloader_dict[domain_name]['val'], log_file, log_ten, metric, note='before_fed')
@@ -217,7 +278,22 @@ def main():
         # 3. Aggregation: Collect shared params and average them into the global model
         client_shared_params = [model_dict[name].get_shared_params() for name in dataobj.train_domain_list]
         client_weights = [weight_dict[name] for name in dataobj.train_domain_list]
-        global_avg_shared_params = FedAvg(client_shared_params, client_weights)
+
+        if args.agg_strategy == 'elma':
+            # --- ELMA Strategy ---
+            log_file.info("Performing Expert-Level Matched Aggregation (ELMA)...")
+            # Generate representations for the global model and all clients
+            global_reps = generate_expert_representations(global_model, prototype_input)
+            client_reps = [generate_expert_representations(model_dict[name], prototype_input) for name in dataobj.train_domain_list]
+            
+            # Call the new aggregation function
+            global_avg_shared_params = ExpertMatchedAvg(client_shared_params, client_weights, global_reps, client_reps, args)
+        else:
+            # --- Standard FedAvg ---
+            log_file.info("Performing standard FedAvg...")
+            global_avg_shared_params = FedAvg(client_shared_params, client_weights)
+
+
         global_model.load_shared_params(global_avg_shared_params)
         
         # 4. Validation of the new global model
@@ -234,7 +310,7 @@ def main():
 
         # 5. Test using the new hybrid evaluation function
         FedTune_testsite_eval(i, args.test_domain, args, global_model, dataloader_dict[args.test_domain]['test'], 
-                         log_file, log_ten, metric, note='test_domain', model_dict=model_dict, domain_stats=domain_stats,
+                         log_file, log_ten, metric, note='test_domain', model_dict=model_dict, domain_stats_private=domain_stats_private, domain_stats_shared=domain_stats_shared,
                          weight_dict=weight_dict)
         
     SaveCheckPoint(args, global_model, args.comm, os.path.join(log_dir, 'checkpoints'), note='last_model')

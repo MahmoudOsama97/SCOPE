@@ -67,7 +67,7 @@ for domain in "${domains[@]}"; do
         --do_ortho \
         --do_adv_private \
         --do_adv_shared \
-        --tta_blend_target global_private \
+        --tta_blend_target disentangled \
         --where ALL_qkv \
         --note "baseline_all"
 done

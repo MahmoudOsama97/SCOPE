@@ -140,15 +140,12 @@ class FedWrapper(nn.Module):
         # 3. Final Classification
         final_output = self.classifier_head(features_pre_head)
         
-        if self.args.do_ortho or self.args.do_adv_shared or self.args.do_adv_private:
-            # Ensure we don't fail if a hook didn't run (e.g., private_blocks_count=0)
-            if private_features is None and shared_features is not None:
-                private_features = torch.zeros_like(shared_features)
-            
-            # This is critical for making the training loop robust
-            return final_output, private_features, shared_features
-        else:
-            return final_output
+        # Always return the features; the calling function will decide what to do with them.
+        # This creates a consistent and robust API for the model.
+        if private_features is None and shared_features is not None:
+            private_features = torch.zeros_like(shared_features)
+        
+        return final_output, private_features, shared_features
 
     # --- get_shared_params and load_shared_params remain UNCHANGED ---
     def get_shared_params(self):

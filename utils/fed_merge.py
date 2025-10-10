@@ -1,5 +1,81 @@
 from collections import OrderedDict
+# Add new imports at the top of the file
+from scipy.optimize import linear_sum_assignment
+from torch.nn.functional import cosine_similarity
+import re
 
+def permute_state_dict(state_dict, permutation_map):
+    """
+    Permutes the expert weights in a state_dict according to a permutation map.
+    """
+    permuted_dict = state_dict.copy()
+    
+    for layer_name, p in permutation_map.items():
+        # p is the permutation for this layer, e.g., [0, 2, 1, 3]
+        for i_orig, i_permuted in enumerate(p):
+            if i_orig == i_permuted:
+                continue # No change needed
+                
+            # Regex to find the expert weights for the original index
+            # This matches keys like '...proj_adapter1_left.0.weight'
+            orig_pattern_left = re.compile(f'({re.escape(layer_name)}\.proj_adapter1_left\.{i_orig}\..*)')
+            orig_pattern_right = re.compile(f'({re.escape(layer_name)}\.proj_adapter1_right\.{i_orig}\..*)')
+            
+            # Keys for the target permuted index
+            permuted_key_left_str = f'{layer_name}.proj_adapter1_left.{i_permuted}.'
+            permuted_key_right_str = f'{layer_name}.proj_adapter1_right.{i_permuted}.'
+            
+            # Find and swap weights
+            for key in list(permuted_dict.keys()):
+                match_left = orig_pattern_left.match(key)
+                if match_left:
+                    suffix = key[match_left.end(1)-len(str(i_orig)):]
+                    new_key = permuted_key_left_str + suffix
+                    permuted_dict[new_key] = state_dict[key]
+
+                match_right = orig_pattern_right.match(key)
+                if match_right:
+                    suffix = key[match_right.end(1)-len(str(i_orig)):]
+                    new_key = permuted_key_right_str + suffix
+                    permuted_dict[new_key] = state_dict[key]
+
+    return permuted_dict
+
+def ExpertMatchedAvg(client_states, client_weights, global_reps, client_reps, args):
+    """
+    Performs Expert-Level Matched Aggregation (ELMA).
+    """
+    permuted_client_states = []
+    
+    # Iterate through each client
+    for client_idx, client_state in enumerate(client_states):
+        client_rep = client_reps[client_idx]
+        permutation_map = {}
+        
+        # For each MoE layer that has a representation
+        for layer_name, global_expert_reps in global_reps.items():
+            if layer_name not in client_rep:
+                continue
+            
+            client_expert_reps = client_rep[layer_name]
+            
+            # Create a cost matrix based on cosine distance (1 - similarity)
+            num_experts = global_expert_reps.shape[0]
+            cost_matrix = torch.zeros((num_experts, num_experts))
+            for i in range(num_experts):
+                for j in range(num_experts):
+                    cost_matrix[i, j] = 1 - cosine_similarity(global_expert_reps[i].unsqueeze(0), client_expert_reps[j].unsqueeze(0))
+            
+            # Solve the assignment problem to find the optimal matching
+            row_ind, col_ind = linear_sum_assignment(cost_matrix.numpy())
+            permutation_map[layer_name] = col_ind # col_ind[i] is the client expert that matches global expert i
+
+        # Permute the client's state_dict according to the map
+        permuted_state = permute_state_dict(client_state, permutation_map)
+        permuted_client_states.append(permuted_state)
+        
+    # Perform standard FedAvg on the now-aligned states
+    return FedAvg(permuted_client_states, client_weights)
 
 def Dict_weight(dict_in, weight_in):
     for k,v in dict_in.items():
