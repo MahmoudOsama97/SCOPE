@@ -58,17 +58,17 @@ for domain in "${domains[@]}"; do
     # Run your program
     python3 algorithms/feddg_moe/train_pacs.py \
         --test_domain $domain \
-        --batch_size 32 \
+        --batch_size 32 --log_similarities \
         --model clip_moe_style \
         --local_epochs 10 \
-        --comm 20 \
+        --comm 10 \
         --private_blocks_count 4 \
         --do_bottleneck \
         --do_ortho \
         --do_adv_private \
         --do_adv_shared \
-        --adv_lambda_private 0.3 \
         --tta_blend_target global_private \
+        --agg_strategy elma \
         --note "baseline_all"
 done
 

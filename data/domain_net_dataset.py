@@ -1,4 +1,4 @@
-from configs.default import domainnet_path
+from configs.default import domain_net_path
 import os
 import torch
 from data.meta_dataset import MetaDataset, GetDataLoaderDict

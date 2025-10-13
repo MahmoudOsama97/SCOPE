@@ -3,6 +3,7 @@ from collections import OrderedDict
 from scipy.optimize import linear_sum_assignment
 from torch.nn.functional import cosine_similarity
 import re
+import torch
 
 def permute_state_dict(state_dict, permutation_map):
     """
@@ -46,7 +47,7 @@ def ExpertMatchedAvg(client_states, client_weights, global_reps, client_reps, ar
     Performs Expert-Level Matched Aggregation (ELMA).
     """
     permuted_client_states = []
-    
+    all_permutation_maps = [] # <--- New list to store maps    
     # Iterate through each client
     for client_idx, client_state in enumerate(client_states):
         client_rep = client_reps[client_idx]
@@ -69,13 +70,13 @@ def ExpertMatchedAvg(client_states, client_weights, global_reps, client_reps, ar
             # Solve the assignment problem to find the optimal matching
             row_ind, col_ind = linear_sum_assignment(cost_matrix.numpy())
             permutation_map[layer_name] = col_ind # col_ind[i] is the client expert that matches global expert i
-
+        all_permutation_maps.append(permutation_map) # Store the map
         # Permute the client's state_dict according to the map
         permuted_state = permute_state_dict(client_state, permutation_map)
         permuted_client_states.append(permuted_state)
         
     # Perform standard FedAvg on the now-aligned states
-    return FedAvg(permuted_client_states, client_weights)
+    return FedAvg(permuted_client_states, client_weights), all_permutation_maps
 
 def Dict_weight(dict_in, weight_in):
     for k,v in dict_in.items():

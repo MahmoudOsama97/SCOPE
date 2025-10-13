@@ -66,7 +66,8 @@ class FedWrapper(nn.Module):
         self.model = model
         self.args = args
         self.private_blocks_count = args.private_blocks_count
-
+        print("\n[DEBUG] Initializing FedWrapper...")
+        print(f"[DEBUG] Private blocks count: {self.private_blocks_count}")
         # --- Component References ---
         self.featurizer = self.model[0]
         self.classifier_head = self.model[1]
@@ -86,14 +87,20 @@ class FedWrapper(nn.Module):
         # --- Conditionally build SOTA components ---
         if self.args.do_bottleneck:
             self.bottleneck = Bottleneck(self.featurizer.num_features)
-        
+            print("[DEBUG] --> Information Bottleneck: ENABLED")
+
         num_domains = len(self.args.site_list)
         # Create SHARED discriminator (for PUSH logic)
         if self.args.do_adv_shared:
             self.shared_domain_discriminator = DomainDiscriminator(self.featurizer.num_features, num_domains)
+            print("[DEBUG] --> Shared Adversarial (PUSH): ENABLED")
         # Create PRIVATE discriminator (for PULL logic)
         if self.args.do_adv_private:
             self.private_domain_discriminator = DomainDiscriminator(self.featurizer.num_features, num_domains)
+            print("[DEBUG] --> Private Adversarial (PULL): ENABLED")
+        if self.args.do_ortho:
+            print("[DEBUG] --> Orthogonality Loss: ENABLED")
+        print("[DEBUG] FedWrapper initialization complete.\n")
 
     def _create_hook(self, name):
         """Creates a hook function that saves the output of a module."""
@@ -147,38 +154,41 @@ class FedWrapper(nn.Module):
         
         return final_output, private_features, shared_features
 
-    # --- get_shared_params and load_shared_params remain UNCHANGED ---
-    def get_shared_params(self):
-        shared_state = OrderedDict()
-        shared_blocks = self.featurizer.blocks[self.private_blocks_count:]
-        for name, param in shared_blocks.named_parameters():
+    def get_trainable_params(self, include_private=False):
+        """
+        A unified function to get trainable parameters from the CORE MODEL.
+        Discriminator parameters are NEVER returned by this function as they are
+        always treated as local, private components.
+        """
+        trainable_state = OrderedDict()
+        
+        for name, param in self.model.named_parameters():
             if param.requires_grad:
-                shared_state[f'0.blocks.{name}'] = param.data.clone()
-        for name, param in self.classifier_head.named_parameters():
-            shared_state[f'1.{name}'] = param.data.clone()
-        # Share the SHARED discriminator if it exists
-        if self.args.do_adv_shared and hasattr(self, 'shared_domain_discriminator'):
-            for name, param in self.shared_domain_discriminator.named_parameters():
-                shared_state[f'shared_domain_discriminator.{name}'] = param.data.clone()
-        # Share the PRIVATE discriminator if it exists
-        if self.args.do_adv_private and hasattr(self, 'private_domain_discriminator'):
-            for name, param in self.private_domain_discriminator.named_parameters():
-                shared_state[f'private_domain_discriminator.{name}'] = param.data.clone()
-        return shared_state
+                is_private = False
+                # Check if the parameter belongs to a private block
+                if '.blocks.' in name:
+                    try:
+                        block_num_str = name.split('.blocks.')[1].split('.')[0]
+                        block_num = int(block_num_str)
+                        if block_num < self.private_blocks_count:
+                            is_private = True
+                    except (IndexError, ValueError):
+                        pass # Not a block parameter
 
-    def load_shared_params(self, shared_state_dict):
-        # We need to load into the base model and potentially the discriminator
-        self.model.load_state_dict(shared_state_dict, strict=False)
-        # Load SHARED discriminator state if it exists
-        if self.args.do_adv_shared and hasattr(self, 'shared_domain_discriminator'):
-            disc_state = {k.replace('shared_domain_discriminator.',''): v for k,v in shared_state_dict.items() if 'shared_domain_discriminator' in k}
-            if disc_state:
-                 self.shared_domain_discriminator.load_state_dict(disc_state, strict=False)
-        # Load PRIVATE discriminator state if it exists
-        if self.args.do_adv_private and hasattr(self, 'private_domain_discriminator'):
-            disc_state = {k.replace('private_domain_discriminator.',''): v for k,v in shared_state_dict.items() if 'private_domain_discriminator' in k}
-            if disc_state:
-                 self.private_domain_discriminator.load_state_dict(disc_state, strict=False)
+                if is_private and not include_private:
+                    continue # Skip private parameters
+                
+                trainable_state[name] = param.data.clone()
+        
+        return trainable_state
+
+    def load_params(self, state_dict):
+        """
+        A unified function to load parameters. Works for both partial and full state dicts.
+        """
+        # Load params for the main sequential model
+        self.model.load_state_dict(state_dict, strict=False)
+        
 def my_get_intermediate_layers(
         featurizer,
         x: torch.Tensor,

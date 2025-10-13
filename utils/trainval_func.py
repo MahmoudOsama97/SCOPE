@@ -110,6 +110,17 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
         # --- Flexible model output and loss calculation ---
         output, p_feats, s_feats = model(imgs)
 
+        # +++ DEBUG SANITY CHECK +++
+        if p_feats is None or s_feats is None:
+            print(f"\n[CRITICAL WARNING] Epoch {epochs}, Batch {i}: Intermediate features are None! Hooks may have failed.")
+            # This can happen if private_blocks_count=0, so handle gracefully
+            if p_feats is None: p_feats = torch.zeros_like(s_feats) if s_feats is not None else None
+            if s_feats is None: s_feats = torch.zeros_like(p_feats) if p_feats is not None else None
+            if p_feats is None and s_feats is None:
+                 print("[ERROR] Both private and shared features are None. Cannot proceed with SOTA losses.")
+                 # In a real scenario, you might raise an error here.
+        # +++ END DEBUG +++
+
         # 1. Standard Classification Loss
         loss = F.cross_entropy(output, labels)
         
@@ -134,6 +145,7 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
             reversed_shared_features = GradientReversalLayerFn.apply(s_feats, args.adv_lambda_shared)
             domain_pred = model.shared_domain_discriminator(reversed_shared_features)
             loss_dom_shared = F.cross_entropy(domain_pred, correct_domain_labels)
+            if i == 0: print(f"[DEBUG] Epoch {epochs}: Shared Adv Loss enabled. Value: {loss_dom_shared.item():.4f}")
             loss += loss_dom_shared
 
         # 4. PRIVATE Trunk Adversarial Loss (PULL toward style)
@@ -146,6 +158,7 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
             # NO Gradient Reversal Layer here. The goal is to help the discriminator.
             domain_pred = model.private_domain_discriminator(p_feats)
             loss_dom_private = F.cross_entropy(domain_pred, correct_domain_labels)
+            if i == 0: print(f"[DEBUG] Epoch {epochs}: Private Adv Loss enabled. Value: {loss_dom_private.item():.4f}")
             loss += args.adv_lambda_private * loss_dom_private
 
         # 4. Conditional Orthogonality Loss (Idea G)
@@ -153,12 +166,19 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
             p_feats = F.normalize(p_feats, p=2, dim=1)
             s_feats = F.normalize(s_feats, p=2, dim=1)
             ortho_loss = torch.mean((p_feats * s_feats).sum(dim=1).pow(2))
+            if i == 0: print(f"[DEBUG] Epoch {epochs}: Ortho Loss enabled. Value: {ortho_loss.item():.4f}")
             loss += args.ortho_lambda * ortho_loss
 
         # 5. Conditional Bottleneck Loss (Idea H)
         if args.do_bottleneck and hasattr(model, 'bottleneck'):
+            if i == 0: print(f"[DEBUG] Epoch {epochs}: Bottleneck Loss enabled. Value: {model.bottleneck.kl_loss.item():.4f}")
             loss += args.beta * model.bottleneck.kl_loss
-            
+        # A final check for NaN loss, which is a common silent failure
+        if torch.isnan(loss):
+            print(f"\n[CRITICAL ERROR] Epoch {epochs}, Batch {i}: Total loss is NaN! Aborting backward pass.")
+            print(f"  - Initial Class Loss: {initial_loss}")
+            # You can add the other loss values here if you store them in variables
+            continue # Skip this batch to prevent crashing
         loss.backward()
         optimizer.step()
 
@@ -213,7 +233,9 @@ def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log
     Test-time evaluation with four strategies: 'public', 'both', 'global_private', and 'disentangled'.
     """
     global_model.eval()
-
+    # +++ DEBUG PRINT AT THE START +++
+    print(f"\n[INFO TTA] Running Test-Time Adaptation with strategy: '{args.tta_blend_target.upper()}'")
+    # +++ END DEBUG +++
     # --- Pre-compute the "neutral average" private trunk state if needed ---
     avg_private_state = None
     if args.tta_blend_target == 'public':
@@ -243,11 +265,19 @@ def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log
                 content_similarities = domain_stats_shared.get_domain_weights(test_s_feats)
                 content_weights = F.softmax(torch.mean(content_similarities, dim=0) * args.inv_temp, dim=0)
 
+                if args.log_similarities:
+                    print(f"  [DEBUG TTA] Style Weights:   {[f'{w:.2f}' for w in style_weights]}")
+                    print(f"  [DEBUG TTA] Content Weights: {[f'{w:.2f}' for w in content_weights]}")
+
             else:
                 # Standard TTA: Single-stream similarity calculation for all other strategies
                 _, _, test_s_feats = global_model(imgs) # Still need shared feats for comparison
                 similarities = domain_stats_shared.get_domain_weights(test_s_feats)
                 batch_similarities = F.softmax(torch.mean(similarities, dim=0) * args.inv_temp, dim=0)
+                # +++ DEBUG PRINT +++
+                if args.log_similarities:
+                    print(f"  [DEBUG TTA] Standard Weights: {[f'{w:.2f}' for w in batch_similarities]}")
+                # +++ END DEBUG +++
 
             # --- 2. Execute Blending Strategy ---
             if args.tta_blend_target == 'disentangled':
@@ -257,15 +287,17 @@ def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log
                 blended_private_state = FedAvg(private_states, style_weights.tolist()) # Use style_weights
                 hybrid_model.model[0].blocks[:private_blocks_count].load_state_dict(blended_private_state)
                 
-                shared_states = [model_dict[name].get_shared_params() for name in args.site_list]
-                blended_shared_state = FedAvg(shared_states, content_weights.tolist()) # Use content_weights
-                hybrid_model.load_shared_params(blended_shared_state)
+                # Get ONLY the shared parameters for content blending
+                shared_states = [model_dict[name].get_trainable_params(include_private=False) for name in args.site_list]
+                blended_shared_state = FedAvg(shared_states, content_weights.tolist())
+                hybrid_model.load_params(blended_shared_state)
 
             else:
                 # --- Logic for the original three strategies ---
-                shared_states = [model_dict[name].get_shared_params() for name in args.site_list]
+                # Get ONLY the shared parameters for blending
+                shared_states = [model_dict[name].get_trainable_params(include_private=False) for name in args.site_list]
                 blended_shared_state = FedAvg(shared_states, batch_similarities.tolist())
-                hybrid_model.load_shared_params(blended_shared_state)
+                hybrid_model.load_params(blended_shared_state)
 
                 if args.tta_blend_target == 'both':
                     private_blocks_count = hybrid_model.private_blocks_count

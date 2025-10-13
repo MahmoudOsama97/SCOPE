@@ -58,16 +58,21 @@ for domain in "${domains[@]}"; do
     # Run your program
     python3 algorithms/feddg_moe/train_vlcs.py \
         --test_domain $domain \
-        --batch_size 32 \
+        --batch_size 32 --log_similarities \
         --model clip_moe_style \
         --local_epochs 10 \
-        --comm 20 \
+        --comm 10 \
         --private_blocks_count 4 \
-        --tta_blend_target global_private \
-        --note "baseline"
+        --do_bottleneck \
+        --do_ortho \
+        --do_adv_private \
+        --do_adv_shared \
+        --tta_blend_target disentangled \
+        --agg_strategy elma \
+        --note "baseline_elma_aggregate_private"
 done
 
-python3 analyze_logs.py --output_folder ./exps --note "baseline"
+python3 analyze_logs.py --output_folder ./exps --note "baseline_elma_aggregate_private"
 
 cp -r $SLURM_TMPDIR/FedDG-MoE2/exps/. /scratch/st-msheha02-1/mosama97/output/
 echo "----------------------------------------"

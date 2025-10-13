@@ -25,36 +25,22 @@ from utils.domain_stats.offline.offline_mahalanobis import OfflineMahalanobisTra
 from utils.domain_stats.offline.offline_cosine import OfflineCosineTracker, OfflineCosineMuVarTracker, OfflineCosineConcat
 from utils.lora_util import CosineTopKGate
 # Create a new helper function before main()
-def generate_expert_representations(model, prototype_input):
+# Replace the entire old function with this new version.
+def generate_expert_representations(model):
     """
-    Uses hooks to capture the average router logits for a model on a fixed input.
-    These logits serve as the representation for each expert.
+    Directly extracts the expert representation vectors from the `sim_matrix`
+    parameter of each CosineTopKGate in the model.
     """
-    captured_logits = {}
-    hooks = []
-
-    def create_hook(name):
-        def hook(model, input, output):
-            captured_logits[name] = output.mean(dim=0).detach().cpu()
-        return hook
-
-    # Register hooks on all router modules inside the sequential model
-    for name, module in model.model.named_modules(): # <--- Search inside model.model
+    expert_representations = {}
+    # Search within the wrapped model for the routers
+    for name, module in model.model.named_modules():
         if isinstance(module, CosineTopKGate):
-            # The 'name' will now be relative to the sequential model (e.g., '0.blocks.8...')
-            hooks.append(module.register_forward_hook(create_hook(name)))
-
-    # Perform a forward pass to trigger the hooks
-    model.eval()
-    with torch.no_grad():
-        model(prototype_input.cuda())
-    model.train()
-
-    # Remove hooks to clean up
-    for h in hooks:
-        h.remove()
-        
-    return captured_logits
+            # The sim_matrix has shape [proj_dim, num_experts].
+            # We want each expert's representation, which is a column.
+            # Transposing gives us shape [num_experts, proj_dim], which is what we need.
+            expert_representations[name] = module.sim_matrix.T.detach().cpu()
+            
+    return expert_representations
 
 def collect_online_stats(model, dataloader, domain_stats, domain_id, args):
     """
@@ -178,6 +164,7 @@ def main():
     log_ten = SummaryWriter(log_dir=tensorboard_dir)
     log_file = Get_Logger(file_name=log_dir + 'train.log', display=args.display)
     Save_Hyperparameter(log_dir, args)
+    prototype_input = torch.randn(args.batch_size, 3, 224, 224)
     # +++ START OF NEW CODE +++
     # --- Print the full argument list to the log file and console ---
     log_file.info("----------------- Training Arguments -----------------")
@@ -205,7 +192,8 @@ def main():
         first_client_model = model_dict[dataobj.train_domain_list[0]]
         print_trainable_parameters(first_client_model, log_file)
     # +++ END OF NEW CODE +++
-    ''' Domain Statistics Tracking'''
+    log_file.info(f"[INFO] Aggregation strategy set to: {args.agg_strategy.upper()}")
+    print(f"[INFO] Aggregation strategy set to: {args.agg_strategy.upper()}")
     # todo get feature level from the GetFedModel
     if args.domain_tracker == 'online_gaussian':
         domain_stats_private = OnlineGaussianTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
@@ -260,9 +248,12 @@ def main():
     for i in range(args.comm + 1):
         # 1. Distribution: Send global shared params to all clients
         if i > 0: # No distribution on the first round
-            global_shared_params = global_model.get_shared_params()
+            include_private_in_dist = (args.tta_blend_target != 'global_private')
+            
+            global_params_to_dist = global_model.get_trainable_params(include_private=include_private_in_dist)
+            
             for domain_name in dataobj.train_domain_list:
-                model_dict[domain_name].load_shared_params(global_shared_params)
+                model_dict[domain_name].load_params(global_params_to_dist)
 
         # 2. Local Training and Stats Collection
         for domain_id, domain_name in enumerate(dataobj.train_domain_list):
@@ -275,23 +266,44 @@ def main():
             site_evaluation(i, domain_name, args, model_dict[domain_name], dataloader_dict[domain_name]['val'], log_file, log_ten, metric, note='before_fed')
 
         # 3. Aggregation: Collect shared params and average them into the global model
-        client_shared_params = [model_dict[name].get_shared_params() for name in dataobj.train_domain_list]
+        include_private_in_agg = (args.tta_blend_target != 'global_private')
+        
+        if include_private_in_agg:
+            log_file.info(f"[INFO] TTA Strategy '{args.tta_blend_target}': Aggregating BOTH private and public trunks.")
+        else:
+            log_file.info(f"[INFO] TTA Strategy '{args.tta_blend_target}': Aggregating PUBLIC trunk ONLY.")
+        
+        # The rest of the code is now correct and does not need to be changed.
+        client_params_to_agg = [model_dict[name].get_trainable_params(include_private=include_private_in_agg) for name in dataobj.train_domain_list]
+        
         client_weights = [weight_dict[name] for name in dataobj.train_domain_list]
+
         if args.agg_strategy == 'elma':
             # --- ELMA Strategy ---
             log_file.info("Performing Expert-Level Matched Aggregation (ELMA)...")
             # Generate representations for the global model and all clients
-            global_reps = generate_expert_representations(global_model, prototype_input)
-            client_reps = [generate_expert_representations(model_dict[name], prototype_input) for name in dataobj.train_domain_list]
-            
+            global_reps = generate_expert_representations(global_model)
+            client_reps = [generate_expert_representations(model_dict[name]) for name in dataobj.train_domain_list]
             # Call the new aggregation function
-            global_avg_shared_params = ExpertMatchedAvg(client_shared_params, client_weights, global_reps, client_reps, args)
+            global_avg_shared_params, permutation_maps = ExpertMatchedAvg(client_params_to_agg, client_weights, global_reps, client_reps, args)
+        # +++ DEBUG PRINT +++
+            # Check the permutation for the first client and a sample layer to see if it's working
+            first_client_perms = permutation_maps[0]
+            sample_layer = list(first_client_perms.keys())[0] if first_client_perms else None
+            if sample_layer:
+                perm_string = str(first_client_perms[sample_layer])
+                log_file.info(f"[DEBUG ELMA] Round {i}, Client 0, Sample Layer '{sample_layer}' Permutation: {perm_string}")
+                # Check for silent failure
+                identity_perm = list(range(len(first_client_perms[sample_layer])))
+                if list(first_client_perms[sample_layer]) == identity_perm:
+                    log_file.warning(f"[WARNING ELMA] Permutation for client 0 is the identity. ELMA may not be effective.")
+            # +++ END DEBUG +++        
         else:
             # --- Standard FedAvg ---
             log_file.info("Performing standard FedAvg...")
-            global_avg_shared_params = FedAvg(client_shared_params, client_weights)
+            global_avg_shared_params = FedAvg(client_params_to_agg, client_weights)
 
-        global_model.load_shared_params(global_avg_shared_params)
+        global_model.load_params(global_avg_shared_params)
         
         # 4. Validation of the new global model
         fed_val = 0.
