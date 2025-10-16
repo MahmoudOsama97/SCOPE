@@ -25,7 +25,7 @@ echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
 
 # Move the code to the compute node
 cp -r /scratch/st-msheha02-1/mosama97/FedDG-MoE2 $SLURM_TMPDIR
-# cp -r /scratch/st-msheha02-1/mosama97/datasets/pacs90.zip $SLURM_TMPDIR/FedDG-MoE2/datasets
+cp -r /scratch/st-msheha02-1/mosama97/datasets/terra_incognita.zip $SLURM_TMPDIR/FedDG-MoE2/datasets
 
 echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
 
@@ -43,36 +43,34 @@ export WANDB_MODE=offline
 # Force Hugging Face and Timm to work offline and not attempt any network connection
 export TRANSFORMERS_OFFLINE=1
 cd $SLURM_TMPDIR/FedDG-MoE2/datasets
-# mv pacs90.zip pacs.zip
-unzip OfficeHome.zip
+unzip terra_incognita.zip
 cd $SLURM_TMPDIR/FedDG-MoE2/
 echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
 domains=(
-  "p"
-  "a"
-  "c"
-  "r"
+  "100"
+  "38"
+  "43"
+  "46"
 )
 
 for domain in "${domains[@]}"; do
     # Run your program
-    python3 algorithms/feddg_moe/train_officehome.py \
+    python3 algorithms/feddg_moe/train_terraIncognita.py \
         --test_domain $domain \
         --batch_size 32 --log_similarities \
         --model clip_moe_style \
         --local_epochs 10 \
-        --comm 10 \
+        --comm 5 \
         --private_blocks_count 4 \
-        --do_adv_private \
+        --do_fci \
+        --fci_lambda 0.1 \
+        --fci_tau 0.07 \
         --do_adv_shared \
-        --do_ortho  \
-        --do_bottleneck \
-        --tta_blend_target disentangled \
-        --agg_strategy elma \
-        --note "baseline_elma_aggregate_private"
+        --tta_blend_target layer_wise \
+        --note "baseline"
 done
 
-python3 analyze_logs.py --output_folder ./exps --note "baseline_elma_aggregate_private"
+python3 analyze_logs.py --output_folder ./exps --note "baseline"
 
 cp -r $SLURM_TMPDIR/FedDG-MoE2/exps/. /scratch/st-msheha02-1/mosama97/output/
 echo "----------------------------------------"

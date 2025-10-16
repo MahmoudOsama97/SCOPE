@@ -63,15 +63,13 @@ for domain in "${domains[@]}"; do
         --local_epochs 10 \
         --comm 10 \
         --private_blocks_count 4 \
-        --do_bottleneck \
-        --do_ortho \
-        --do_adv_private \
-        --do_adv_shared \
-        --tta_blend_target disentangled \
-        --note "baseline_aggregate_private"
+        --do_fci \
+        --fci_lambda 0.1 \
+        --fci_tau 0.07 \
+        --note "baseline"
 done
 
-python3 analyze_logs.py --output_folder ./exps --note "baseline_aggregate_private"
+python3 analyze_logs.py --output_folder ./exps --note "baseline"
 
 cp -r $SLURM_TMPDIR/FedDG-MoE2/exps/. /scratch/st-msheha02-1/mosama97/output/
 echo "----------------------------------------"

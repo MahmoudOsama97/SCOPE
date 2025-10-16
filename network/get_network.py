@@ -72,18 +72,34 @@ class FedWrapper(nn.Module):
         self.featurizer = self.model[0]
         self.classifier_head = self.model[1]
         
-        # --- Hook Setup ---
         self.captured_features = {}
+        self.shared_adapter_indices = []  # NEW: Store indices of adapted shared layers
 
-        # Identify the exact layers to hook into
+        # Hook for the private trunk (remains the same)
         if self.private_blocks_count > 0:
             last_private_block = self.featurizer.blocks[self.private_blocks_count - 1]
             last_private_block.register_forward_hook(self._create_hook('private'))
 
-        # The last shared block is the final block of the featurizer
-        last_shared_block = self.featurizer.blocks[-1]
-        last_shared_block.register_forward_hook(self._create_hook('shared'))
-        
+        # NEW: Hook for EACH adaptable shared block
+        for i in range(self.private_blocks_count, len(self.featurizer.blocks)):
+            block = self.featurizer.blocks[i]
+            # A robust check to see if the block has any trainable parameters (i.e., an adapter)
+            if any(p.requires_grad for p in block.parameters()):
+                hook_name = f'shared_block_{i}'
+                block.register_forward_hook(self._create_hook(hook_name))
+                self.shared_adapter_indices.append(i)
+                print(f"[DEBUG] L-TTA Hook enabled for shared block: {i}")
+
+        # Ensure we always have a hook on the final block for backward compatibility
+        if not self.shared_adapter_indices or self.shared_adapter_indices[-1] != len(self.featurizer.blocks) - 1:
+            last_block_idx = len(self.featurizer.blocks) - 1
+            if any(p.requires_grad for p in self.featurizer.blocks[last_block_idx].parameters()):
+                # Only add if it's not already there
+                if last_block_idx not in self.shared_adapter_indices:
+                    hook_name = f'shared_block_{last_block_idx}'
+                    self.featurizer.blocks[last_block_idx].register_forward_hook(self._create_hook(hook_name))
+                    self.shared_adapter_indices.append(last_block_idx)
+                    self.shared_adapter_indices.sort() # Keep indices in order
         # --- Conditionally build SOTA components ---
         if self.args.do_bottleneck:
             self.bottleneck = Bottleneck(self.featurizer.num_features)
@@ -110,18 +126,43 @@ class FedWrapper(nn.Module):
             self.captured_features[name] = output[:, 0]
         return hook
 
-    # +++ ADD THIS NEW HELPER METHOD +++
     def _register_hooks(self):
         """
-        (Re)registers the forward hooks to the internal model's layers.
+        (Re)registers ALL forward hooks to the internal model's layers.
         Crucial for making deepcopied instances functional.
         """
-        if self.private_blocks_count > 0:
-            last_private_block = self.model[0].blocks[self.private_blocks_count - 1]
-            last_private_block.register_forward_hook(self._create_hook('private'))
+        # Hook for the private trunk
+        if self.private_blocks_count > 0 and self.private_blocks_count <= len(self.model[0].blocks):
+            private_block = self.model[0].blocks[self.private_blocks_count - 1]
+            private_block.register_forward_hook(self._create_hook('private'))
 
-        last_shared_block = self.model[0].blocks[-1]
-        last_shared_block.register_forward_hook(self._create_hook('shared'))
+        # Hook for EACH adaptable shared block, using the stored indices
+        for i in self.shared_adapter_indices:
+            if i < len(self.model[0].blocks):
+                hook_name = f'shared_block_{i}'
+                block = self.model[0].blocks[i]
+                block.register_forward_hook(self._create_hook(hook_name))
+
+    def get_layer_trainable_params(self, layer_idx):
+        """
+        Gets the state dict for only the trainable parameters of a specific block.
+        This is a robust alternative to string matching.
+        """
+        if not (0 <= layer_idx < len(self.featurizer.blocks)):
+            return OrderedDict()
+
+        block = self.featurizer.blocks[layer_idx]
+        layer_state = OrderedDict()
+        
+        # Find parameters within this specific block
+        for name, param in block.named_parameters():
+            if param.requires_grad:
+                # The key needs to be the full path for load_state_dict,
+                # which includes the prefix for the wrapped model.
+                full_key = f'model.0.blocks.{layer_idx}.{name}' # <-- FIX: Added "model." prefix
+                layer_state[full_key] = param.data.clone()
+        
+        return layer_state
 
     def forward(self, x):
         # 1. Clear previous features and run the original, proven forward pass
@@ -133,8 +174,13 @@ class FedWrapper(nn.Module):
         # triggering our hooks and storing the 'private' and 'shared' features.
 
         private_features = self.captured_features.get('private', None)
-        shared_features = self.captured_features.get('shared', None)
 
+        # NEW: Collect all captured shared features into a dictionary
+        shared_features_dict = {}
+        for i in self.shared_adapter_indices:
+            key = f'shared_block_{i}'
+            if key in self.captured_features:
+                shared_features_dict[i] = self.captured_features[key]
         # 2. Optional: Information Bottleneck
         # The bottleneck is now an external operation, not part of the main flow.
         # It processes the captured private features. This is much cleaner.
@@ -146,13 +192,13 @@ class FedWrapper(nn.Module):
 
         # 3. Final Classification
         final_output = self.classifier_head(features_pre_head)
-        
-        # Always return the features; the calling function will decide what to do with them.
-        # This creates a consistent and robust API for the model.
-        if private_features is None and shared_features is not None:
-            private_features = torch.zeros_like(shared_features)
-        
-        return final_output, private_features, shared_features
+        # Handle the case where private trunk doesn't exist
+        if private_features is None and shared_features_dict:
+            # Use a feature map from the earliest shared block as a shape reference
+            ref_tensor = shared_features_dict[min(shared_features_dict.keys())]
+            private_features = torch.zeros_like(ref_tensor)        
+            
+        return final_output, private_features, shared_features_dict
 
     def get_trainable_params(self, include_private=False):
         """
@@ -188,7 +234,7 @@ class FedWrapper(nn.Module):
         """
         # Load params for the main sequential model
         self.model.load_state_dict(state_dict, strict=False)
-        
+
 def my_get_intermediate_layers(
         featurizer,
         x: torch.Tensor,

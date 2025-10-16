@@ -12,6 +12,36 @@ from utils.fed_merge import FedAvg
 # Import the GRL class from where it is defined
 from network.get_network import GetNetwork, feats_extractor, GradientReversalLayerFn
 # --- END OF MODIFIED LINE ---
+
+def compute_local_prototypes(model, dataloader, num_classes, feature_dim):
+    """
+    Computes local class prototypes by averaging features for each class.
+    """
+    model.eval()
+    all_features = [[] for _ in range(num_classes)]
+    
+    with torch.no_grad():
+        for imgs, labels, _ in dataloader:
+            imgs = imgs.cuda()
+            _, _, s_feats_dict = model(imgs)
+            
+            # Use features from the final shared block as the representation
+            if not s_feats_dict: continue
+            last_layer_idx = max(s_feats_dict.keys())
+            s_feats = s_feats_dict[last_layer_idx]
+
+            for i in range(len(labels)):
+                all_features[labels[i]].append(s_feats[i])
+
+    prototypes = torch.zeros(num_classes, feature_dim).cuda()
+    for i in range(num_classes):
+        if all_features[i]:
+            class_features = torch.stack(all_features[i], dim=0)
+            prototypes[i] = torch.mean(class_features, dim=0)
+            
+    model.train()
+    return prototypes.detach().cpu() # Return on CPU to simulate sending to server
+
 def Shuffle_Batch_Data(data_in):
     len_total = len(data_in)
     idx_list = list(range(len_total))
@@ -92,14 +122,14 @@ def site_only_evaluation(model, dataloader, metric):
     return results_dict
 
 
-def feddgmoe_site_train(comm_rounds, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id):
+def feddgmoe_site_train(comm_rounds, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id, global_prototypes=None):
     tbar = tqdm(range(args.local_epochs))
     for local_epoch in tbar:
         tbar.set_description(f'{site_name}_train')
-        feddgmoe_epoch_site_train(comm_rounds*args.local_epochs + local_epoch, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id)
+        feddgmoe_epoch_site_train(comm_rounds*args.local_epochs + local_epoch, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id, global_prototypes)
 
 # Replace the old feddgmoe_epoch_site_train with this new version
-def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id):
+def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id, global_prototypes=None):
     model.train()
     for i, data_list in enumerate(dataloader):
         imgs, labels, _ = data_list
@@ -108,8 +138,12 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
         optimizer.zero_grad()
         
         # --- Flexible model output and loss calculation ---
-        output, p_feats, s_feats = model(imgs)
-
+        output, p_feats, s_feats_dict = model(imgs)
+        s_feats = None
+        if s_feats_dict:
+            last_layer_idx = max(s_feats_dict.keys())
+            s_feats = s_feats_dict[last_layer_idx]
+            
         # +++ DEBUG SANITY CHECK +++
         if p_feats is None or s_feats is None:
             print(f"\n[CRITICAL WARNING] Epoch {epochs}, Batch {i}: Intermediate features are None! Hooks may have failed.")
@@ -174,9 +208,30 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
             if i == 0: print(f"[DEBUG] Epoch {epochs}: Bottleneck Loss enabled. Value: {model.bottleneck.kl_loss.item():.4f}")
             loss += args.beta * model.bottleneck.kl_loss
         # A final check for NaN loss, which is a common silent failure
+        
+        
+        # --- NEW: Federated Contrastive Invariance (FCI) Loss ---
+        if args.do_fci and global_prototypes is not None and s_feats is not None:
+            # Ensure prototypes are on the correct device
+            global_prototypes_gpu = global_prototypes.cuda()
+            
+            # Normalize features and prototypes for stable cosine similarity
+            s_feats_norm = F.normalize(s_feats, p=2, dim=1)
+            protos_norm = F.normalize(global_prototypes_gpu, p=2, dim=1)
+            
+            # Calculate cosine similarities (logits)
+            # sim_matrix shape: [batch_size, num_classes]
+            sim_matrix = torch.mm(s_feats_norm, protos_norm.t())
+            
+            # The InfoNCE loss is equivalent to cross-entropy on the similarity logits
+            loss_fci = F.cross_entropy(sim_matrix / args.fci_tau, labels)
+            
+            loss += args.fci_lambda * loss_fci
+
+
         if torch.isnan(loss):
             print(f"\n[CRITICAL ERROR] Epoch {epochs}, Batch {i}: Total loss is NaN! Aborting backward pass.")
-            print(f"  - Initial Class Loss: {initial_loss}")
+            print(f"  - Current Batch Loss Value (before NaN): {loss.item()}") 
             # You can add the other loss values here if you store them in variables
             continue # Skip this batch to prevent crashing
         loss.backward()
@@ -244,82 +299,140 @@ def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log
         num_clients = len(args.site_list)
         uniform_weights = [1.0 / num_clients] * num_clients
         avg_private_state = FedAvg(all_private_states, uniform_weights)
-
-    with torch.no_grad():
-        for imgs, labels, domain_labels, in tqdm(dataloader):
-            imgs = imgs.cuda()
-
-            hybrid_model = copy.deepcopy(global_model)
-            hybrid_model._register_hooks()
-
-            # --- 1. Get Similarity Weights based on the Strategy ---
-            if args.tta_blend_target == 'disentangled':
-                # D-TTA: Dual-stream similarity calculation
-                _, test_p_feats, test_s_feats = global_model(imgs)
+    # --- MAIN L-TTA LOGIC ---
+    if args.tta_blend_target == 'layer_wise':
+        domain_stats_per_layer = domain_stats_shared  # Rename for clarity
+        hybrid_model = copy.deepcopy(global_model)
+        hybrid_model._register_hooks()
+        
+        with torch.no_grad():
+            for imgs, labels, _, in tqdm(dataloader):
+                imgs = imgs.cuda()
                 
-                # A. Style Similarity
-                style_similarities = domain_stats_private.get_domain_weights(test_p_feats)
-                style_weights = F.softmax(torch.mean(style_similarities, dim=0) * args.inv_temp, dim=0)
+                # 1. Get all intermediate features for the test batch
+                _, _, test_s_feats_dict = global_model(imgs)
                 
-                # B. Content Similarity
-                content_similarities = domain_stats_shared.get_domain_weights(test_s_feats)
-                content_weights = F.softmax(torch.mean(content_similarities, dim=0) * args.inv_temp, dim=0)
+                # Start with a clean copy of the global model's full state dict
+                final_blended_state = global_model.state_dict()
 
-                if args.log_similarities:
-                    print(f"  [DEBUG TTA] Style Weights:   {[f'{w:.2f}' for w in style_weights]}")
-                    print(f"  [DEBUG TTA] Content Weights: {[f'{w:.2f}' for w in content_weights]}")
+                # 2. Loop through each adaptable layer to blend its parameters
+                for layer_idx, tracker in domain_stats_per_layer.items():
+                    if layer_idx not in test_s_feats_dict: continue # Skip if no features
+                    
+                    test_feats = test_s_feats_dict[layer_idx]
+                    
+                    # Calculate similarity weights for THIS LAYER
+                    similarities = tracker.get_domain_weights(test_feats)
+                    layer_weights = F.softmax(torch.mean(similarities, dim=0) * args.inv_temp, dim=0)
+                    
+                    if args.log_similarities:
+                        print(f"  [DEBUG L-TTA Layer {layer_idx}] Weights: {[f'{w:.2f}' for w in layer_weights]}")
 
-            else:
-                # Standard TTA: Single-stream similarity calculation for all other strategies
-                _, _, test_s_feats = global_model(imgs) # Still need shared feats for comparison
-                similarities = domain_stats_shared.get_domain_weights(test_s_feats)
-                batch_similarities = F.softmax(torch.mean(similarities, dim=0) * args.inv_temp, dim=0)
-                # +++ DEBUG PRINT +++
-                if args.log_similarities:
-                    print(f"  [DEBUG TTA] Standard Weights: {[f'{w:.2f}' for w in batch_similarities]}")
-                # +++ END DEBUG +++
-
-            # --- 2. Execute Blending Strategy ---
-            if args.tta_blend_target == 'disentangled':
-                # ** OPTION 4: Disentangled Blending **
-                private_blocks_count = hybrid_model.private_blocks_count
-                private_states = [model_dict[name].model[0].blocks[:private_blocks_count].state_dict() for name in args.site_list]
-                blended_private_state = FedAvg(private_states, style_weights.tolist()) # Use style_weights
-                hybrid_model.model[0].blocks[:private_blocks_count].load_state_dict(blended_private_state)
+                    # Extract this layer's adapters from each client
+                    layer_states = [
+                        model_dict[name].get_layer_trainable_params(layer_idx)
+                        for name in args.site_list
+                    ]
+                    
+                    # Blend the parameters for this layer
+                    if any(layer_states):
+                        blended_layer_params = FedAvg(layer_states, layer_weights.tolist())
+                        final_blended_state.update(blended_layer_params)
                 
-                # Get ONLY the shared parameters for content blending
-                shared_states = [model_dict[name].get_trainable_params(include_private=False) for name in args.site_list]
-                blended_shared_state = FedAvg(shared_states, content_weights.tolist())
-                hybrid_model.load_params(blended_shared_state)
+                # 3. Load the fully composed state dict
+                hybrid_model.load_state_dict(final_blended_state)
+                
+                out, _, _ = hybrid_model(imgs)
+                metric.update(out, labels)
 
-            else:
-                # --- Logic for the original three strategies ---
-                # Get ONLY the shared parameters for blending
-                shared_states = [model_dict[name].get_trainable_params(include_private=False) for name in args.site_list]
-                blended_shared_state = FedAvg(shared_states, batch_similarities.tolist())
-                hybrid_model.load_params(blended_shared_state)
+    # --- LOGIC FOR ORIGINAL TTA STRATEGIES (with compatibility fix) ---
+    else:
+        with torch.no_grad():
+            for imgs, labels, domain_labels, in tqdm(dataloader):
+                imgs = imgs.cuda()
 
-                if args.tta_blend_target == 'both':
+                hybrid_model = copy.deepcopy(global_model)
+                hybrid_model._register_hooks()
+
+                # --- 1. Get Similarity Weights based on the Strategy ---
+                if args.tta_blend_target == 'disentangled':
+                    # D-TTA: Dual-stream similarity calculation
+                    # Get all features, then extract the ones needed
+                    _, test_p_feats, test_s_feats_dict = global_model(imgs)
+                    
+                    # COMPATIBILITY: Extract final layer features for old methods
+                    test_s_feats = None
+                    if test_s_feats_dict:
+                        last_layer_idx = max(test_s_feats_dict.keys())
+                        test_s_feats = test_s_feats_dict[last_layer_idx]
+                    # A. Style Similarity
+                    style_similarities = domain_stats_private.get_domain_weights(test_p_feats)
+                    style_weights = F.softmax(torch.mean(style_similarities, dim=0) * args.inv_temp, dim=0)
+                    
+                    # B. Content Similarity
+                    content_similarities = domain_stats_shared.get_domain_weights(test_s_feats)
+                    content_weights = F.softmax(torch.mean(content_similarities, dim=0) * args.inv_temp, dim=0)
+
+                    if args.log_similarities:
+                        print(f"  [DEBUG TTA] Style Weights:   {[f'{w:.2f}' for w in style_weights]}")
+                        print(f"  [DEBUG TTA] Content Weights: {[f'{w:.2f}' for w in content_weights]}")
+
+                else:
+                    # Standard TTA: Single-stream similarity calculation for all other strategies
+                    _, _, test_s_feats_dict = global_model(imgs) 
+
+                    test_s_feats = None
+                    if test_s_feats_dict:
+                        last_layer_idx = max(test_s_feats_dict.keys())
+                        test_s_feats = test_s_feats_dict[last_layer_idx]
+                    similarities = domain_stats_shared.get_domain_weights(test_s_feats)
+                    batch_similarities = F.softmax(torch.mean(similarities, dim=0) * args.inv_temp, dim=0)
+                    # +++ DEBUG PRINT +++
+                    if args.log_similarities:
+                        print(f"  [DEBUG TTA] Standard Weights: {[f'{w:.2f}' for w in batch_similarities]}")
+                    # +++ END DEBUG +++
+
+                # --- 2. Execute Blending Strategy ---
+                if args.tta_blend_target == 'disentangled':
+                    # ** OPTION 4: Disentangled Blending **
                     private_blocks_count = hybrid_model.private_blocks_count
                     private_states = [model_dict[name].model[0].blocks[:private_blocks_count].state_dict() for name in args.site_list]
-                    blended_private_state = FedAvg(private_states, batch_similarities.tolist())
+                    blended_private_state = FedAvg(private_states, style_weights.tolist()) # Use style_weights
                     hybrid_model.model[0].blocks[:private_blocks_count].load_state_dict(blended_private_state)
-                
-                elif args.tta_blend_target == 'public':
-                    private_blocks_count = hybrid_model.private_blocks_count
-                    hybrid_model.model[0].blocks[:private_blocks_count].load_state_dict(avg_private_state)
-                
-                elif args.tta_blend_target == 'global_private':
-                    pass
+                    
+                    # Get ONLY the shared parameters for content blending
+                    shared_states = [model_dict[name].get_trainable_params(include_private=False) for name in args.site_list]
+                    blended_shared_state = FedAvg(shared_states, content_weights.tolist())
+                    hybrid_model.load_params(blended_shared_state)
 
-            # 3. Predict with the assembled hybrid model
-            model_output = hybrid_model(imgs)
-            if isinstance(model_output, tuple):
-                out = model_output[0]
-            else:
-                out = model_output
-            
-            metric.update(out, labels)
+                else:
+                    # --- Logic for the original three strategies ---
+                    # Get ONLY the shared parameters for blending
+                    shared_states = [model_dict[name].get_trainable_params(include_private=False) for name in args.site_list]
+                    blended_shared_state = FedAvg(shared_states, batch_similarities.tolist())
+                    hybrid_model.load_params(blended_shared_state)
+
+                    if args.tta_blend_target == 'both':
+                        private_blocks_count = hybrid_model.private_blocks_count
+                        private_states = [model_dict[name].model[0].blocks[:private_blocks_count].state_dict() for name in args.site_list]
+                        blended_private_state = FedAvg(private_states, batch_similarities.tolist())
+                        hybrid_model.model[0].blocks[:private_blocks_count].load_state_dict(blended_private_state)
+                    
+                    elif args.tta_blend_target == 'public':
+                        private_blocks_count = hybrid_model.private_blocks_count
+                        hybrid_model.model[0].blocks[:private_blocks_count].load_state_dict(avg_private_state)
+                    
+                    elif args.tta_blend_target == 'global_private':
+                        pass
+
+                # 3. Predict with the assembled hybrid model
+                model_output = hybrid_model(imgs)
+                if isinstance(model_output, tuple):
+                    out = model_output[0]
+                else:
+                    out = model_output
+                
+                metric.update(out, labels)
             
     results_dict = metric.results()
     log_ten.add_scalar(f'{note}_{site_name}_loss', results_dict['loss'], epochs)
@@ -418,6 +531,8 @@ def feddgmoe_testsite_eval(epochs, site_name, args, model, dataloader, log_file,
     print(f'{note} Round: {epochs:3d} | Epochs: {args.local_epochs*epochs:3d} | Domain: {site_name} | loss: {results_dict["loss"]:.4f} | Acc: {results_dict["acc"]*100:.2f}%')
     
     return results_dict
+
+
 
 
 # +++ START OF NEW FUNCTION +++

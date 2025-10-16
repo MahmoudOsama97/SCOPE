@@ -10,7 +10,7 @@ from data.officehome_dataset import OfficeHome_FedDG
 from utils.classification_metric import Classification 
 from utils.log_utils import *
 from utils.fed_merge import Cal_Weight_Dict, FedAvg, FedUpdate, ExpertMatchedAvg, permute_state_dict
-from utils.trainval_func import site_evaluation, feddgmoe_site_train, FedTune_testsite_eval, GetFedModel, SaveCheckPoint, print_trainable_parameters
+from utils.trainval_func import site_evaluation, feddgmoe_site_train, FedTune_testsite_eval, GetFedModel, SaveCheckPoint, print_trainable_parameters, compute_local_prototypes
 import torch.nn.functional as F
 from tqdm import tqdm
 import torch
@@ -52,38 +52,48 @@ def collect_online_stats(model, dataloader, domain_stats, domain_id, args):
             features = feats_extractor(inputs.cuda(), model, avg_tokens=args.avg_tokens, num_layers=args.num_layers)
             domain_stats.update(features, domain_id)
 
+
 def collect_offline_stats(model, dataloader, domain_stats_private, domain_stats_shared, domain_id, args):
-    """
-    Collects offline statistics robustly for ALL TTA strategies.
-    """
     all_private_features = []
-    all_shared_features = []
-    
-    # Determine if we need to collect private features based on the TTA strategy
     needs_private_stats = (args.tta_blend_target == 'disentangled')
+
+    # Initialize collectors based on the type of domain_stats_shared
+    if args.tta_blend_target == 'layer_wise':
+        all_shared_features_per_layer = {i: [] for i in domain_stats_shared.keys()}
+    else:
+        all_shared_features = []
 
     with torch.no_grad():
         for inputs, _, _ in dataloader:
-            # The model now consistently returns a 3-part tuple
-            _, p_feats, s_feats = model(inputs.cuda())
+            _, p_feats, s_feats_dict = model(inputs.cuda())
             
-            # Conditionally collect private features only when needed
-            if needs_private_stats:
-                if p_feats is not None:
-                    all_private_features.append(p_feats)
+            if needs_private_stats and p_feats is not None:
+                all_private_features.append(p_feats)
             
-            # Always collect shared features, as they are needed by all TTA strategies
-            if s_feats is not None:
-                all_shared_features.append(s_feats)
+            # Conditionally collect shared features
+            if args.tta_blend_target == 'layer_wise':
+                for layer_idx, feats in s_feats_dict.items():
+                    if layer_idx in all_shared_features_per_layer:
+                        all_shared_features_per_layer[layer_idx].append(feats)
+            else:
+                if s_feats_dict:
+                    last_layer_idx = max(s_feats_dict.keys())
+                    all_shared_features.append(s_feats_dict[last_layer_idx])
 
-    # Refit the trackers with the collected features
+    # Refit private tracker (no change)
     if needs_private_stats and all_private_features:
-        all_private_features = torch.cat(all_private_features, dim=0)
-        domain_stats_private.refit(all_private_features, domain_id)
+        domain_stats_private.refit(torch.cat(all_private_features, dim=0), domain_id)
     
-    if all_shared_features:
-        all_shared_features = torch.cat(all_shared_features, dim=0)
-        domain_stats_shared.refit(all_shared_features, domain_id)
+    # Conditionally refit shared trackers
+    if args.tta_blend_target == 'layer_wise':
+        for layer_idx, tracker in domain_stats_shared.items():
+            if all_shared_features_per_layer[layer_idx]:
+                all_feats = torch.cat(all_shared_features_per_layer[layer_idx], dim=0)
+                tracker.refit(all_feats, domain_id)
+    else:
+        if all_shared_features:
+            all_feats = torch.cat(all_shared_features, dim=0)
+            domain_stats_shared.refit(all_feats, domain_id)
 
 def get_argparse():
     parser = argparse.ArgumentParser()
@@ -116,7 +126,7 @@ def get_argparse():
     parser.add_argument('--gmm_covariance_type', help='Covariance type for GMM', type=str, default='diag', 
                         choices=['full', 'tied', 'diag', 'spherical'])
     ### test time eval args
-    parser.add_argument('--tta_blend_target', type=str, default='global_private', choices=['public', 'both', 'global_private', 'disentangled'],
+    parser.add_argument('--tta_blend_target', type=str, default='global_private', choices=['public', 'both', 'global_private', 'disentangled', 'layer_wise'],
                         help='Which trunk(s) to adapt at test time. "public": adapt content, use average style. "both": adapt content and style. "global_private": adapt content, use global style. "disentangled": dual-stream adaptation for style and content.')
     parser.add_argument('--batch_agg_type', type=str, default='pre_similarity', 
                       choices=['pre_similarity', 'post_similarity'], 
@@ -148,7 +158,10 @@ def get_argparse():
     # --- Information Bottleneck Arguments (Idea H) ---
     parser.add_argument('--do_bottleneck', action='store_true', help='Enable information bottleneck on the private trunk.')
     parser.add_argument('--beta', type=float, default=1e-5, help='Weight for the KL divergence loss of the bottleneck.')
-    
+        # --- Federated Contrastive Invariance (FCI) Loss Arguments ---
+    parser.add_argument('--do_fci', action='store_true', help='Enable Federated Contrastive Invariance loss.')
+    parser.add_argument('--fci_lambda', type=float, default=0.1, help='Weight for the FCI loss.')
+    parser.add_argument('--fci_tau', type=float, default=0.07, help='Temperature parameter (tau) for the FCI loss.')
     # +++ END OF NEW CODE +++
     # misc args
     parser.add_argument('--aux_loss_weight', type=float, default=0.01, help='Weight for the MoE auxiliary loss. Set to 0 to disable.')
@@ -195,79 +208,98 @@ def main():
     log_file.info(f"[INFO] Aggregation strategy set to: {args.agg_strategy.upper()}")
     print(f"[INFO] Aggregation strategy set to: {args.agg_strategy.upper()}")
     # todo get feature level from the GetFedModel
-    if args.domain_tracker == 'online_gaussian':
-        domain_stats_private = OnlineGaussianTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
-        domain_stats_shared = OnlineGaussianTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
-        log_file.info('Using Online Gaussian Tracker')
-        print('Using Online Gaussian Tracker')
-    elif args.domain_tracker == 'offline_cosine_muvar':
-        domain_stats_private = OfflineCosineMuVarTracker(args)
-        domain_stats_shared = OfflineCosineMuVarTracker(args)
-        log_file.info('Using Offline Cosine MuVar Tracker')
-        print('Using Offline Cosine MuVar Tracker')
-    elif args.domain_tracker == 'offline_cosine_concat':
-        domain_stats_private = OfflineCosineConcat(args)
-        domain_stats_shared = OfflineCosineConcat(args)
-        log_file.info('Using Offline Cosine Concat Tracker')
-        print('Using Offline Cosine Concat Tracker')
-    elif args.domain_tracker == 'online_cosine':
-        domain_stats_private = OnlineCosineTracker(num_domains=len(dataobj.train_domain_list))
-        domain_stats_shared = OnlineCosineTracker(num_domains=len(dataobj.train_domain_list))        
-        log_file.info('Using Online Cosine Tracker')
-        print('Using Online Cosine Tracker')
-    elif args.domain_tracker == 'online_gmm':
-        domain_stats_private = OnlineGMMTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
-        domain_stats_shared = OnlineGMMTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))         
-        log_file.info('Using Online GMM Tracker')
-        print('Using Online GMM Tracker')
-    elif args.domain_tracker == 'offline_gmm':
-        domain_stats_private = OfflineGMMTracker(args)
-        domain_stats_shared = OfflineGMMTracker(args)        
-        log_file.info(f'Using Offline GMM Tracker with {args.gmm_num_components} components and {args.gmm_covariance_type} covariance')
-        print(f'Using Offline GMM Tracker with {args.gmm_num_components} components and {args.gmm_covariance_type} covariance')
-    elif args.domain_tracker == 'offline_mahalanobis':
-        domain_stats_private = OfflineMahalanobisTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
-        domain_stats_shared = OfflineMahalanobisTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list)) 
-        log_file.info('Using Offline Mahalanobis Tracker')
-        print('Using Offline Mahalanobis Tracker')
-    elif args.domain_tracker == 'offline_cosine':
-        domain_stats_private = OfflineCosineTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
-        domain_stats_shared = OfflineCosineTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list)) 
-        log_file.info('Using Offline Cosine Tracker')
-        print('Using Offline Cosine Tracker')
+    def create_tracker(args):    
+        if args.domain_tracker == 'online_gaussian':
+            log_file.info('Using Online Gaussian Tracker')
+            print('Using Online Gaussian Tracker')
+            return OnlineGaussianTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
+        elif args.domain_tracker == 'offline_cosine_muvar':
+            log_file.info('Using Offline Cosine MuVar Tracker')
+            print('Using Offline Cosine MuVar Tracker')
+            return OfflineCosineMuVarTracker(args)
+        elif args.domain_tracker == 'offline_cosine_concat':
+            log_file.info('Using Offline Cosine Concat Tracker')
+            print('Using Offline Cosine Concat Tracker')
+            return OfflineCosineConcat(args)
+        elif args.domain_tracker == 'online_cosine':
+            log_file.info('Using Online Cosine Tracker')
+            print('Using Online Cosine Tracker')
+            return OnlineCosineTracker(num_domains=len(dataobj.train_domain_list))
+        elif args.domain_tracker == 'online_gmm':
+            log_file.info('Using Online GMM Tracker')
+            print('Using Online GMM Tracker')
+            return OnlineGMMTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
+        elif args.domain_tracker == 'offline_gmm':
+            log_file.info(f'Using Offline GMM Tracker with {args.gmm_num_components} components and {args.gmm_covariance_type} covariance')
+            print(f'Using Offline GMM Tracker with {args.gmm_num_components} components and {args.gmm_covariance_type} covariance')
+            return OfflineGMMTracker(args)
+        elif args.domain_tracker == 'offline_mahalanobis':
+            log_file.info('Using Offline Mahalanobis Tracker')
+            print('Using Offline Mahalanobis Tracker')            
+            return OfflineMahalanobisTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
+        elif args.domain_tracker == 'offline_cosine':
+            log_file.info('Using Offline Cosine Tracker')
+            print('Using Offline Cosine Tracker')
+            return OfflineCosineTracker(feature_dim=768, num_domains=len(dataobj.train_domain_list))
+        else:
+            raise ValueError(f"Unknown domain tracker: {args.domain_tracker}")
+
+    # --- NEW: Conditional Tracker Setup ---
+    first_client_model = model_dict[dataobj.train_domain_list[0]]
+    shared_adapter_indices = first_client_model.shared_adapter_indices
+    
+    domain_stats_private = create_tracker(args)
+    domain_stats_shared = None # This will hold either a single tracker or a dict
+
+    if args.tta_blend_target == 'layer_wise':
+        domain_stats_shared = {
+            i: create_tracker(args) for i in shared_adapter_indices
+        }
+        log_file.info(f"Initialized L-TTA trackers for shared layers: {shared_adapter_indices}")
     else:
-        raise ValueError(f"Unknown domain tracker: {args.domain_tracker}")
-
-
+        domain_stats_shared = create_tracker(args)
+        log_file.info(f"Initialized a single shared tracker for TTA strategy: '{args.tta_blend_target}'")
     # Simplified stats collection function selection
     collect_stats = collect_offline_stats if 'offline_' in args.domain_tracker else collect_online_stats
 
-
+    # NEW: Initialize global prototypes
+    global_prototypes = None
+    feature_dim = global_model.model[0].num_features
     FedUpdate(model_dict, global_model)
     best_val = 0.
     for i in range(args.comm + 1):
         # 1. Distribution: Send global shared params to all clients
         if i > 0: # No distribution on the first round
-            include_private_in_dist = (args.tta_blend_target != 'global_private')
-            
+            # include_private_in_dist = (args.tta_blend_target != 'global_private')
+            strategies_that_do_not_aggregate_private_trunk = ['global_private', 'layer_wise']
+            include_private_in_dist = (args.tta_blend_target not in strategies_that_do_not_aggregate_private_trunk)
             global_params_to_dist = global_model.get_trainable_params(include_private=include_private_in_dist)
             
             for domain_name in dataobj.train_domain_list:
                 model_dict[domain_name].load_params(global_params_to_dist)
 
         # 2. Local Training and Stats Collection
+        local_prototypes_list = []
         for domain_id, domain_name in enumerate(dataobj.train_domain_list):
             feddgmoe_site_train(i, domain_name, args, model_dict[domain_name], optimizer_dict[domain_name], 
-                      scheduler_dict[domain_name], dataloader_dict[domain_name]['train'], log_ten, metric, domain_id)
+                      scheduler_dict[domain_name], dataloader_dict[domain_name]['train'], log_ten, metric, domain_id, global_prototypes=global_prototypes)
             
             collect_stats(model_dict[domain_name], dataloader_dict[domain_name]['train'], domain_stats_private, domain_stats_shared, domain_id, args)
-            
+            # NEW: After training, compute local prototypes for this client
+            print(f"Computing local prototypes for client {domain_name}...")
+            local_protos = compute_local_prototypes(
+                model_dict[domain_name],
+                dataloader_dict[domain_name]['train'], # Use train loader for prototypes
+                args.num_classes,
+                feature_dim
+            )
+            local_prototypes_list.append(local_protos)            
             # Optional: You can still evaluate the performance of each full client model
             site_evaluation(i, domain_name, args, model_dict[domain_name], dataloader_dict[domain_name]['val'], log_file, log_ten, metric, note='before_fed')
 
         # 3. Aggregation: Collect shared params and average them into the global model
-        include_private_in_agg = (args.tta_blend_target != 'global_private')
-        
+        strategies_that_do_not_aggregate_private_trunk = ['global_private', 'layer_wise']
+        include_private_in_agg = (args.tta_blend_target not in strategies_that_do_not_aggregate_private_trunk)
         if include_private_in_agg:
             log_file.info(f"[INFO] TTA Strategy '{args.tta_blend_target}': Aggregating BOTH private and public trunks.")
         else:
@@ -304,7 +336,10 @@ def main():
             global_avg_shared_params = FedAvg(client_params_to_agg, client_weights)
 
         global_model.load_params(global_avg_shared_params)
-        
+        if args.do_fci and local_prototypes_list:
+            print("Aggregating local prototypes into global prototypes...")
+            # Stack all local prototype tensors and average them
+            global_prototypes = torch.stack(local_prototypes_list).mean(dim=0)        
         # 4. Validation of the new global model
         fed_val = 0.
         for domain_name in dataobj.train_domain_list:
