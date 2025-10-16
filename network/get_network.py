@@ -107,9 +107,20 @@ class FedWrapper(nn.Module):
 
         num_domains = len(self.args.site_list)
         # Create SHARED discriminator (for PUSH logic)
+        # --- NEW: Conditional Setup for Per-Layer or Final-Layer Discriminators ---
         if self.args.do_adv_shared:
-            self.shared_domain_discriminator = DomainDiscriminator(self.featurizer.num_features, num_domains)
-            print("[DEBUG] --> Shared Adversarial (PUSH): ENABLED")
+            feature_dim = self.featurizer.num_features
+            if self.args.per_layer_adv:
+                print("[DEBUG] --> Per-Layer Shared Adversarial (PUSH): ENABLED")
+                # Create a discriminator for each adaptable shared layer
+                discriminators = {}
+                for layer_idx in self.shared_adapter_indices:
+                    discriminators[f'disc_{layer_idx}'] = DomainDiscriminator(feature_dim, num_domains)
+                self.shared_domain_discriminators = nn.ModuleDict(discriminators)
+            else:
+                print("[DEBUG] --> Final-Layer Shared Adversarial (PUSH): ENABLED")
+                # Original behavior: a single discriminator
+                self.shared_domain_discriminator = DomainDiscriminator(feature_dim, num_domains)
         # Create PRIVATE discriminator (for PULL logic)
         if self.args.do_adv_private:
             self.private_domain_discriminator = DomainDiscriminator(self.featurizer.num_features, num_domains)

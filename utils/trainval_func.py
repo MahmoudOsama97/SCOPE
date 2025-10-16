@@ -139,104 +139,104 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
         
         # --- Flexible model output and loss calculation ---
         output, p_feats, s_feats_dict = model(imgs)
-        s_feats = None
-        if s_feats_dict:
-            last_layer_idx = max(s_feats_dict.keys())
-            s_feats = s_feats_dict[last_layer_idx]
-            
-        # +++ DEBUG SANITY CHECK +++
-        if p_feats is None or s_feats is None:
-            print(f"\n[CRITICAL WARNING] Epoch {epochs}, Batch {i}: Intermediate features are None! Hooks may have failed.")
-            # This can happen if private_blocks_count=0, so handle gracefully
-            if p_feats is None: p_feats = torch.zeros_like(s_feats) if s_feats is not None else None
-            if s_feats is None: s_feats = torch.zeros_like(p_feats) if p_feats is not None else None
-            if p_feats is None and s_feats is None:
-                 print("[ERROR] Both private and shared features are None. Cannot proceed with SOTA losses.")
-                 # In a real scenario, you might raise an error here.
-        # +++ END DEBUG +++
 
-        # 1. Standard Classification Loss
+        # --- 1. Standard Task Loss & Aux Loss (Unchanged) ---
         loss = F.cross_entropy(output, labels)
-        
-        # 2. MoE Auxiliary Loss (Regulated)
         if args.aux_loss_weight > 0:
             loss_aux = 0
             for n, m in model.named_modules():
                 if hasattr(m, 'aux_loss'):
-                    # Check for stability before adding
                     if not torch.isnan(m.aux_loss) and not torch.isinf(m.aux_loss):
                         loss_aux += m.aux_loss
-            
-            # Add the weighted, stable aux loss
             loss += args.aux_loss_weight * loss_aux
-        # 3. SHARED Trunk Adversarial Loss (PUSH away from style)
-        if args.do_adv_shared and hasattr(model, 'shared_domain_discriminator'):
-            # --- MOVED LOGIC HERE ---
-            batch_size = s_feats.shape[0]
-            correct_domain_labels = torch.full((batch_size,), fill_value=domain_id, dtype=torch.long, device=s_feats.device)
-            # --- END MOVED LOGIC ---
-            
-            reversed_shared_features = GradientReversalLayerFn.apply(s_feats, args.adv_lambda_shared)
-            domain_pred = model.shared_domain_discriminator(reversed_shared_features)
-            loss_dom_shared = F.cross_entropy(domain_pred, correct_domain_labels)
-            if i == 0: print(f"[DEBUG] Epoch {epochs}: Shared Adv Loss enabled. Value: {loss_dom_shared.item():.4f}")
-            loss += loss_dom_shared
 
-        # 4. PRIVATE Trunk Adversarial Loss (PULL toward style)
-        if args.do_adv_private and hasattr(model, 'private_domain_discriminator'):
-            # --- MOVED LOGIC HERE ---
+        # --- 2. Private Trunk "Style Concentration" Loss (Unchanged) ---
+        if args.do_adv_private and p_feats is not None and hasattr(model, 'private_domain_discriminator'):
             batch_size = p_feats.shape[0]
             correct_domain_labels = torch.full((batch_size,), fill_value=domain_id, dtype=torch.long, device=p_feats.device)
-            # --- END MOVED LOGIC ---
-
-            # NO Gradient Reversal Layer here. The goal is to help the discriminator.
             domain_pred = model.private_domain_discriminator(p_feats)
             loss_dom_private = F.cross_entropy(domain_pred, correct_domain_labels)
-            if i == 0: print(f"[DEBUG] Epoch {epochs}: Private Adv Loss enabled. Value: {loss_dom_private.item():.4f}")
             loss += args.adv_lambda_private * loss_dom_private
 
-        # 4. Conditional Orthogonality Loss (Idea G)
-        if args.do_ortho:
-            p_feats = F.normalize(p_feats, p=2, dim=1)
-            s_feats = F.normalize(s_feats, p=2, dim=1)
-            ortho_loss = torch.mean((p_feats * s_feats).sum(dim=1).pow(2))
-            if i == 0: print(f"[DEBUG] Epoch {epochs}: Ortho Loss enabled. Value: {ortho_loss.item():.4f}")
+        # --- 3. Shared Trunk "Content Purification" Losses ---
+        
+        # --- 3a. Per-Layer FCI and/or Adversarial Loss ---
+        if (args.do_fci and args.per_layer_fci) or (args.do_adv_shared and args.per_layer_adv):
+            total_fci_loss = 0
+            total_adv_loss = 0
+            num_layers_processed = 0
+
+            if args.do_fci and global_prototypes is not None:
+                global_prototypes_gpu = global_prototypes.cuda()
+                protos_norm = F.normalize(global_prototypes_gpu, p=2, dim=1)
+
+            for layer_idx, s_feats in s_feats_dict.items():
+                
+                # Apply Per-Layer FCI Loss
+                if args.do_fci and args.per_layer_fci and global_prototypes is not None:
+                    s_feats_norm = F.normalize(s_feats, p=2, dim=1)
+                    sim_matrix = torch.mm(s_feats_norm, protos_norm.t())
+                    total_fci_loss += F.cross_entropy(sim_matrix / args.fci_tau, labels)
+
+                # Apply Per-Layer Adversarial Loss
+                if args.do_adv_shared and args.per_layer_adv and hasattr(model, 'shared_domain_discriminators'):
+                    discriminator = model.shared_domain_discriminators[f'disc_{layer_idx}']
+                    reversed_shared_features = GradientReversalLayerFn.apply(s_feats, args.adv_lambda_shared)
+                    batch_size = s_feats.shape[0]
+                    correct_domain_labels = torch.full((batch_size,), fill_value=domain_id, dtype=torch.long, device=s_feats.device)
+                    domain_pred = discriminator(reversed_shared_features)
+                    total_adv_loss += F.cross_entropy(domain_pred, correct_domain_labels)
+                
+                num_layers_processed += 1
+            
+            if num_layers_processed > 0:
+                if total_fci_loss > 0:
+                    loss += args.fci_lambda * (total_fci_loss / num_layers_processed)
+                if total_adv_loss > 0:
+                    loss += total_adv_loss / num_layers_processed
+
+        # --- 3b. Final-Layer FCI and/or Adversarial Loss (Fallback) ---
+        else:
+            final_s_feats = s_feats_dict[max(s_feats_dict.keys())] if s_feats_dict else None
+            if final_s_feats is not None:
+                
+                # Apply Final-Layer FCI Loss
+                if args.do_fci and global_prototypes is not None:
+                    global_prototypes_gpu = global_prototypes.cuda()
+                    protos_norm = F.normalize(global_prototypes_gpu, p=2, dim=1)
+                    s_feats_norm = F.normalize(final_s_feats, p=2, dim=1)
+                    sim_matrix = torch.mm(s_feats_norm, protos_norm.t())
+                    loss_fci = F.cross_entropy(sim_matrix / args.fci_tau, labels)
+                    loss += args.fci_lambda * loss_fci
+                
+                # Apply Final-Layer Adversarial Loss
+                if args.do_adv_shared and hasattr(model, 'shared_domain_discriminator'):
+                    reversed_shared_features = GradientReversalLayerFn.apply(final_s_feats, args.adv_lambda_shared)
+                    batch_size = final_s_feats.shape[0]
+                    correct_domain_labels = torch.full((batch_size,), fill_value=domain_id, dtype=torch.long, device=final_s_feats.device)
+                    domain_pred = model.shared_domain_discriminator(reversed_shared_features)
+                    loss += F.cross_entropy(domain_pred, correct_domain_labels)
+
+        # --- 4. Other Losses (Ortho, Bottleneck) - Unchanged ---
+        final_s_feats_for_other_losses = s_feats_dict[max(s_feats_dict.keys())] if s_feats_dict else None
+        if args.do_ortho and p_feats is not None and final_s_feats_for_other_losses is not None:
+            p_feats_norm = F.normalize(p_feats, p=2, dim=1)
+            s_feats_norm = F.normalize(final_s_feats_for_other_losses, p=2, dim=1)
+            ortho_loss = torch.mean((p_feats_norm * s_feats_norm).sum(dim=1).pow(2))
             loss += args.ortho_lambda * ortho_loss
 
-        # 5. Conditional Bottleneck Loss (Idea H)
-        if args.do_bottleneck and hasattr(model, 'bottleneck'):
-            if i == 0: print(f"[DEBUG] Epoch {epochs}: Bottleneck Loss enabled. Value: {model.bottleneck.kl_loss.item():.4f}")
+        if args.do_bottleneck and hasattr(model, 'bottleneck') and p_feats is not None:
+            _ = model.bottleneck(p_feats) # This call populates the kl_loss
             loss += args.beta * model.bottleneck.kl_loss
-        # A final check for NaN loss, which is a common silent failure
-        
-        
-        # --- NEW: Federated Contrastive Invariance (FCI) Loss ---
-        if args.do_fci and global_prototypes is not None and s_feats is not None:
-            # Ensure prototypes are on the correct device
-            global_prototypes_gpu = global_prototypes.cuda()
-            
-            # Normalize features and prototypes for stable cosine similarity
-            s_feats_norm = F.normalize(s_feats, p=2, dim=1)
-            protos_norm = F.normalize(global_prototypes_gpu, p=2, dim=1)
-            
-            # Calculate cosine similarities (logits)
-            # sim_matrix shape: [batch_size, num_classes]
-            sim_matrix = torch.mm(s_feats_norm, protos_norm.t())
-            
-            # The InfoNCE loss is equivalent to cross-entropy on the similarity logits
-            loss_fci = F.cross_entropy(sim_matrix / args.fci_tau, labels)
-            
-            loss += args.fci_lambda * loss_fci
 
-
+        # --- Backward Pass and Optimizer Step (Unchanged) ---
         if torch.isnan(loss):
             print(f"\n[CRITICAL ERROR] Epoch {epochs}, Batch {i}: Total loss is NaN! Aborting backward pass.")
-            print(f"  - Current Batch Loss Value (before NaN): {loss.item()}") 
-            # You can add the other loss values here if you store them in variables
-            continue # Skip this batch to prevent crashing
+            continue
+        
         loss.backward()
         optimizer.step()
-
+        
         log_ten.add_scalar(f'{site_name}_train_loss', loss.item(), epochs * len(dataloader) + i)
         metric.update(output, labels)
     

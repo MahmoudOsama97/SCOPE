@@ -25,7 +25,7 @@ echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
 
 # Move the code to the compute node
 cp -r /scratch/st-msheha02-1/mosama97/FedDG-MoE2 $SLURM_TMPDIR
-cp -r /scratch/st-msheha02-1/mosama97/datasets/vlcs90.zip $SLURM_TMPDIR/FedDG-MoE2/datasets
+# cp -r /scratch/st-msheha02-1/mosama97/datasets/pacs81.zip $SLURM_TMPDIR/FedDG-MoE2/datasets
 
 echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
 
@@ -43,29 +43,31 @@ export WANDB_MODE=offline
 # Force Hugging Face and Timm to work offline and not attempt any network connection
 export TRANSFORMERS_OFFLINE=1
 cd $SLURM_TMPDIR/FedDG-MoE2/datasets
-mv vlcs90.zip vlcs.zip
-unzip vlcs.zip
+# mv pacs81.zip pacs.zip
+unzip OfficeHome.zip
 cd $SLURM_TMPDIR/FedDG-MoE2/
 echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
 domains=(
-  "v"
-  "l"
+  "p"
+  "a"
   "c"
-  "s"
+  "r"
 )
 
 for domain in "${domains[@]}"; do
     # Run your program
-    python3 algorithms/feddg_moe/train_vlcs.py \
+    python3 algorithms/feddg_moe/train_officehome.py \
         --test_domain $domain \
         --batch_size 32 --log_similarities \
         --model clip_moe_style \
         --local_epochs 10 \
-        --comm 10 \
+        --comm 5 \
         --private_blocks_count 4 \
-        --do_fci \
-        --fci_lambda 0.5 \
-        --fci_tau 0.07 \
+        --do_adv_shared \
+        --adv_lambda_shared 0.1 \
+        --per_layer_adv \
+        --agg_strategy fedavg \
+        --tta_blend_target global_private \
         --note "baseline"
 done
 

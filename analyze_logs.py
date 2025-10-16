@@ -35,7 +35,7 @@ def parse_log_files(log_paths: list[Path]) -> defaultdict[int, dict[str, float]]
         Example: {0: {'p': 94.3, 'a': 83.8, ...}, 1: {...}}
     """
     ### MODIFIED ### - Regex now captures the domain name as group 2
-    log_pattern = re.compile(r"test_domain Round:\s+(\d+).*Domain:\s+([pacrsvl]).*Acc:\s+([\d.]+)%")
+    log_pattern = re.compile(r"test_domain Round:\s+(\d+).*Domain:\s+(p|a|c|r|s|v|l|i|q|100|38|43|46).*Acc:\s+([\d.]+)%")
     
     # Data structure now maps round -> domain -> accuracy
     round_to_domain_accuracies = defaultdict(dict)

@@ -63,6 +63,7 @@ for domain in "${domains[@]}"; do
         --local_epochs 10 \
         --comm 10 \
         --private_blocks_count 4 \
+        --per_layer_fci \
         --do_fci \
         --fci_lambda 0.1 \
         --fci_tau 0.07 \

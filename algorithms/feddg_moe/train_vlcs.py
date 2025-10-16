@@ -142,9 +142,16 @@ def get_argparse():
     # --- Disentanglement Boundary Arguments (Idea A) ---
     parser.add_argument('--private_blocks_count', type=int, default=4, help='Number of transformer blocks to keep private (style).')
 
-# --- Shared Trunk Adversarial (Push Away from Style) ---
+    # --- Shared Trunk Adversarial (Push Away from Style) ---
     parser.add_argument('--do_adv_shared', action='store_true', help='Enable adversarial loss on SHARED trunk to enforce domain invariance.')
     parser.add_argument('--adv_lambda_shared', type=float, default=0.1, help='Weight for the SHARED trunk adversarial loss.')
+    parser.add_argument('--per_layer_adv', action='store_true', help='If --do_adv_shared, apply adversarial loss at each shared layer instead of just the final one.')
+
+    # --- Federated Contrastive Invariance (FCI) Loss Arguments ---
+    parser.add_argument('--do_fci', action='store_true', help='Enable Federated Contrastive Invariance loss.')
+    parser.add_argument('--fci_lambda', type=float, default=0.1, help='Weight for the FCI loss.')
+    parser.add_argument('--fci_tau', type=float, default=0.07, help='Temperature parameter (tau) for the FCI loss.')
+    parser.add_argument('--per_layer_fci', action='store_true', help='If --do_fci, apply FCI loss at each shared layer instead of just the final one.')
 
     # --- Private Trunk Adversarial (Pull Toward Style) ---
     parser.add_argument('--do_adv_private', action='store_true', help='Enable adversarial loss on PRIVATE trunk to enforce domain specificity.')
@@ -157,10 +164,7 @@ def get_argparse():
     # --- Information Bottleneck Arguments (Idea H) ---
     parser.add_argument('--do_bottleneck', action='store_true', help='Enable information bottleneck on the private trunk.')
     parser.add_argument('--beta', type=float, default=1e-5, help='Weight for the KL divergence loss of the bottleneck.')
-        # --- Federated Contrastive Invariance (FCI) Loss Arguments ---
-    parser.add_argument('--do_fci', action='store_true', help='Enable Federated Contrastive Invariance loss.')
-    parser.add_argument('--fci_lambda', type=float, default=0.1, help='Weight for the FCI loss.')
-    parser.add_argument('--fci_tau', type=float, default=0.07, help='Temperature parameter (tau) for the FCI loss.')
+
     # +++ END OF NEW CODE +++
     # misc args
     parser.add_argument('--aux_loss_weight', type=float, default=0.01, help='Weight for the MoE auxiliary loss. Set to 0 to disable.')
