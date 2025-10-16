@@ -88,7 +88,7 @@ class FedWrapper(nn.Module):
                 hook_name = f'shared_block_{i}'
                 block.register_forward_hook(self._create_hook(hook_name))
                 self.shared_adapter_indices.append(i)
-                print(f"[DEBUG] L-TTA Hook enabled for shared block: {i}")
+                print(f"[DEBUG] Intermediate feature hook enabled for shared block: {i}")
 
         # Ensure we always have a hook on the final block for backward compatibility
         if not self.shared_adapter_indices or self.shared_adapter_indices[-1] != len(self.featurizer.blocks) - 1:
