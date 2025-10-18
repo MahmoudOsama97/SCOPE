@@ -63,12 +63,6 @@ for domain in "${domains[@]}"; do
         --model clip_moe_style \
         --local_epochs 10 \
         --comm 5 \
-        --private_blocks_count 4 \
-        --do_fci \
-        --fci_lambda 0.1 \
-        --fci_tau 0.07 \
-        --do_adv_shared \
-        --tta_blend_target layer_wise \
         --note "baseline"
 done
 

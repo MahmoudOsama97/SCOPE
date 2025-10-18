@@ -127,8 +127,9 @@ def get_argparse():
     parser.add_argument('--gmm_covariance_type', help='Covariance type for GMM', type=str, default='diag', 
                         choices=['full', 'tied', 'diag', 'spherical'])
     ### test time eval args
-    parser.add_argument('--tta_blend_target', type=str, default='global_private', choices=['public', 'both', 'global_private', 'disentangled', 'layer_wise'],
-                        help='Which trunk(s) to adapt at test time. "public": adapt content, use average style. "both": adapt content and style. "global_private": adapt content, use global style. "disentangled": dual-stream adaptation for style and content.')
+    parser.add_argument('--tta_blend_target', type=str, default='global_private', 
+                        choices=['none', 'public', 'both', 'global_private', 'disentangled', 'layer_wise'],
+                        help='Which trunk(s) to adapt at test time. "none" disables TTA and uses the raw global model.')
     parser.add_argument('--batch_agg_type', type=str, default='pre_similarity', 
                       choices=['pre_similarity', 'post_similarity'], 
                       help='How to aggregate batch features: pre_similarity averages features before computing similarities, post_similarity computes similarities per sample then averages')

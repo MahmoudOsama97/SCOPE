@@ -172,7 +172,22 @@ class FedWrapper(nn.Module):
                 # which includes the prefix for the wrapped model.
                 full_key = f'model.0.blocks.{layer_idx}.{name}' # <-- FIX: Added "model." prefix
                 layer_state[full_key] = param.data.clone()
-        
+
+        # +++ START DEBUG INJECTION +++
+        # This tripwire checks for the silent failure condition where a layer
+        # SHOULD have trainable parameters, but none were found due to a path mismatch.
+        if not layer_state and layer_idx in self.shared_adapter_indices:
+            print("\n" + "="*80)
+            print("[CRITICAL BUG DETECTED] SILENT FAILURE IN Layer-Wise TTA (L-TTA)!")
+            print(f"  - FUNCTION: FedWrapper.get_layer_trainable_params in get_network.py")
+            print(f"  - REASON: Failed to find any trainable parameters for block {layer_idx}.")
+            print(f"  - IMPACT: L-TTA will not adapt this layer at test-time, using the base global")
+            print(f"            model instead. This will degrade performance and invalidate results.")
+            print(f"  - LIKELY CAUSE: The hardcoded parameter path prefix 'model.0.blocks...' is")
+            print(f"                  no longer valid due to a refactor of the FedWrapper model.")
+            print("="*80 + "\n")
+        # +++ END DEBUG INJECTION +++
+
         return layer_state
 
     def forward(self, x):

@@ -63,11 +63,8 @@ for domain in "${domains[@]}"; do
         --local_epochs 10 \
         --comm 10 \
         --private_blocks_count 4 \
-        --do_adv_shared \
-        --adv_lambda_shared 0.1 \
-        --per_layer_adv \
         --agg_strategy fedavg \
-        --tta_blend_target global_private \
+        --tta_blend_target none \
         --note "baseline"
 done
 

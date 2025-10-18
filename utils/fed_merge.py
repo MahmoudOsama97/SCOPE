@@ -11,6 +11,17 @@ def permute_state_dict(state_dict, permutation_map):
     """
     permuted_dict = state_dict.copy()
     
+    # +++ START DEBUG INJECTION +++
+    # This tripwire checks if the function actually does any work.
+    # If the regex fails, this counter will remain 0.
+    num_params_swapped = 0
+    # Also, check if the permutation map is non-trivial. A trivial map isn't a bug.
+    is_map_non_trivial = any(
+        any(i != p_i for i, p_i in enumerate(p))
+        for p in permutation_map.values()
+    )
+    # +++ END DEBUG INJECTION +++
+
     for layer_name, p in permutation_map.items():
         # p is the permutation for this layer, e.g., [0, 2, 1, 3]
         for i_orig, i_permuted in enumerate(p):
@@ -33,13 +44,31 @@ def permute_state_dict(state_dict, permutation_map):
                     suffix = key[match_left.end(1)-len(str(i_orig)):]
                     new_key = permuted_key_left_str + suffix
                     permuted_dict[new_key] = state_dict[key]
-
+                    # +++ START DEBUG INJECTION +++
+                    num_params_swapped += 1
+                    # +++ END DEBUG INJECTION +++
                 match_right = orig_pattern_right.match(key)
                 if match_right:
                     suffix = key[match_right.end(1)-len(str(i_orig)):]
                     new_key = permuted_key_right_str + suffix
                     permuted_dict[new_key] = state_dict[key]
-
+                    # +++ START DEBUG INJECTION +++
+                    num_params_swapped += 1
+                    # +++ END DEBUG INJECTION +++
+    # +++ START DEBUG INJECTION +++
+    # The CRITICAL check: If the permutation map required changes, but we swapped nothing,
+    # it means the regex failed to find the parameter names.
+    if is_map_non_trivial and num_params_swapped == 0:
+        print("\n" + "="*80)
+        print("[CRITICAL BUG DETECTED] SILENT FAILURE IN ELMA AGGREGATION!")
+        print("  - FUNCTION: permute_state_dict in fed_merge.py")
+        print("  - REASON: The model's expert parameters could not be found via regex.")
+        print("  - IMPACT: ELMA is NOT working. Experts are being averaged incorrectly,")
+        print("            which will degrade model performance and invalidate results.")
+        print("  - LIKELY CAUSE: The internal naming of the MoE layers in 'lora_util.py'")
+        print("                  has changed, breaking the hardcoded regex patterns here.")
+        print("="*80 + "\n")
+    # +++ END DEBUG INJECTION +++
     return permuted_dict
 
 def ExpertMatchedAvg(client_states, client_weights, global_reps, client_reps, args):

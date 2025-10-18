@@ -140,6 +140,12 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
         # --- Flexible model output and loss calculation ---
         output, p_feats, s_feats_dict = model(imgs)
 
+        # +++ START DEBUG INJECTION: LOSS COMPONENT LOGGING +++
+        # At the start of each batch, create a small dictionary to hold loss values for logging
+        if i == 0 and (epochs % 1 == 0): # Log only for the first batch of every N epochs
+             print(f"\n--- Loss Health Check (Epoch {epochs}, Site '{site_name}') ---")
+        # +++ END DEBUG INJECTION +++
+
         # --- 1. Standard Task Loss & Aux Loss (Unchanged) ---
         loss = F.cross_entropy(output, labels)
         if args.aux_loss_weight > 0:
@@ -191,9 +197,17 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
             
             if num_layers_processed > 0:
                 if total_fci_loss > 0:
-                    loss += args.fci_lambda * (total_fci_loss / num_layers_processed)
+                    avg_fci_loss = total_fci_loss / num_layers_processed
+                    # +++ START DEBUG INJECTION +++
+                    if i == 0 and (epochs % 1 == 0): print(f"  [ACTIVE] Per-Layer FCI Loss (Avg): {avg_fci_loss.item():.4f}")
+                    # +++ END DEBUG INJECTION +++
+                    loss += args.fci_lambda * avg_fci_loss
                 if total_adv_loss > 0:
-                    loss += total_adv_loss / num_layers_processed
+                    avg_adv_loss = total_adv_loss / num_layers_processed
+                    # +++ START DEBUG INJECTION +++
+                    if i == 0 and (epochs % 1 == 0): print(f"  [ACTIVE] Per-Layer Shared Adv Loss (Avg): {avg_adv_loss.item():.4f}")
+                    # +++ END DEBUG INJECTION +++
+                    loss += avg_adv_loss # Lambda is applied inside GRL
 
         # --- 3b. Final-Layer FCI and/or Adversarial Loss (Fallback) ---
         else:
@@ -207,6 +221,9 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
                     s_feats_norm = F.normalize(final_s_feats, p=2, dim=1)
                     sim_matrix = torch.mm(s_feats_norm, protos_norm.t())
                     loss_fci = F.cross_entropy(sim_matrix / args.fci_tau, labels)
+                    # +++ START DEBUG INJECTION +++
+                    if i == 0 and (epochs % 1 == 0): print(f"  [ACTIVE] Final-Layer FCI Loss: {loss_fci.item():.4f}")
+                    # +++ END DEBUG INJECTION +++
                     loss += args.fci_lambda * loss_fci
                 
                 # Apply Final-Layer Adversarial Loss
@@ -215,7 +232,11 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
                     batch_size = final_s_feats.shape[0]
                     correct_domain_labels = torch.full((batch_size,), fill_value=domain_id, dtype=torch.long, device=final_s_feats.device)
                     domain_pred = model.shared_domain_discriminator(reversed_shared_features)
-                    loss += F.cross_entropy(domain_pred, correct_domain_labels)
+                    loss_adv_shared = F.cross_entropy(domain_pred, correct_domain_labels)
+                    # +++ START DEBUG INJECTION +++
+                    if i == 0 and (epochs % 1 == 0): print(f"  [ACTIVE] Final-Layer Shared Adv Loss: {loss_adv_shared.item():.4f}")
+                    # +++ END DEBUG INJECTION +++                    
+                    loss += loss_adv_shared
 
         # --- 4. Other Losses (Ortho, Bottleneck) - Unchanged ---
         final_s_feats_for_other_losses = s_feats_dict[max(s_feats_dict.keys())] if s_feats_dict else None
@@ -287,6 +308,25 @@ def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log
     """
     Test-time evaluation with four strategies: 'public', 'both', 'global_private', and 'disentangled'.
     """
+    # +++ START OF NEW IMPLEMENTATION +++
+    # This is the "off switch" for TTA.
+    if args.tta_blend_target == 'none':
+        log_file.info(f"[INFO TTA] Test-Time Adaptation is DISABLED. Running standard evaluation on the global model.")
+        print(f"\n[INFO TTA] Test-Time Adaptation is DISABLED. Running standard evaluation on the global model.")
+        
+        # Reuse the existing, standard evaluation function for a clean baseline.
+        return site_evaluation(
+            epochs=epochs, 
+            site_name=site_name, 
+            args=args, 
+            model=global_model, 
+            dataloader=dataloader, 
+            log_file=log_file, 
+            log_ten=log_ten, 
+            metric=metric, 
+            note=note
+        )
+    # +++ END OF NEW IMPLEMENTATION +++
     global_model.eval()
     # +++ DEBUG PRINT AT THE START +++
     print(f"\n[INFO TTA] Running Test-Time Adaptation with strategy: '{args.tta_blend_target.upper()}'")
