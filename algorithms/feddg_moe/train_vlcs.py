@@ -52,6 +52,40 @@ def collect_online_stats(model, dataloader, domain_stats, domain_id, args):
             features = feats_extractor(inputs.cuda(), model, avg_tokens=args.avg_tokens, num_layers=args.num_layers)
             domain_stats.update(features, domain_id)
 
+# +++ START OF NEW FUNCTION +++
+def collect_migs_stats(model, dataloader):
+    """
+    Collects layer-wise mean and covariance statistics for the MIGS loss.
+    This is independent of any TTA statistics collection.
+    """
+    model.eval() # Ensure model is in eval mode for stats collection
+    
+    # Find all adaptable shared layers from the model's hook list
+    shared_adapter_indices = model.shared_adapter_indices
+    all_shared_features_per_layer = {i: [] for i in shared_adapter_indices}
+
+    with torch.no_grad():
+        for inputs, _, _ in dataloader:
+            _, _, s_feats_dict = model(inputs.cuda()) # Keep feats on GPU
+            for layer_idx, feats in s_feats_dict.items():
+                if layer_idx in all_shared_features_per_layer:
+                    all_shared_features_per_layer[layer_idx].append(feats) # Append GPU tensor
+    
+    migs_stats_for_server = {}
+    for layer_idx, feat_list in all_shared_features_per_layer.items():
+        if feat_list:
+            all_feats = torch.cat(feat_list, dim=0) # Concatenate on GPU
+            
+            mean_val = torch.mean(all_feats, dim=0)
+            centered_feats = all_feats - mean_val
+            cov_val = (centered_feats.T @ centered_feats) / (all_feats.shape[0] - 1)
+            
+            # Only move the final, small tensors to CPU for sending to server
+            migs_stats_for_server[layer_idx] = {'mean': mean_val.cpu(), 'cov': cov_val.cpu()}
+    
+    model.train()
+    return migs_stats_for_server
+
 def collect_offline_stats(model, dataloader, domain_stats_private, domain_stats_shared, domain_id, args):
     all_private_features = []
     needs_private_stats = (args.tta_blend_target == 'disentangled')
@@ -139,7 +173,11 @@ def get_argparse():
     parser.add_argument('--prior_strength', help='Strength of the prior distribution (higher values give more weight to prior)', type=float, default=1.0)
     # parser.add_argument('--expert_rank', type=int, default=8, help='expert rank for the MoE layer')
     # +++ START OF NEW CODE +++
-    
+    # --- Mutual Information Gradient Stopper (MIGS) Loss Arguments ---
+    parser.add_argument('--do_migs', action='store_true', help='Enable the layer-wise Mutual Information Gradient Stopper (MIGS) loss.')
+    parser.add_argument('--migs_lambda_mean', type=float, default=0.1, help='Weight for the MIGS mean alignment loss.')
+    parser.add_argument('--migs_lambda_cov', type=float, default=0.1, help='Weight for the MIGS covariance alignment loss.')
+    # +++ END OF NEW CODE +++      
     # --- Disentanglement Boundary Arguments (Idea A) ---
     parser.add_argument('--private_blocks_count', type=int, default=4, help='Number of transformer blocks to keep private (style).')
 
@@ -286,9 +324,20 @@ def main():
         local_prototypes_list = []
         for domain_id, domain_name in enumerate(dataobj.train_domain_list):
             feddgmoe_site_train(i, domain_name, args, model_dict[domain_name], optimizer_dict[domain_name], 
-                      scheduler_dict[domain_name], dataloader_dict[domain_name]['train'], log_ten, metric, domain_id, global_prototypes=global_prototypes)
+                      scheduler_dict[domain_name], dataloader_dict[domain_name]['train'], log_ten, metric, domain_id, global_prototypes=global_prototypes, global_stats=global_stats_for_migs if args.do_migs else None)
             
-            collect_stats(model_dict[domain_name], dataloader_dict[domain_name]['train'], domain_stats_private, domain_stats_shared, domain_id, args)
+
+            # --- TTA STATISTICS COLLECTION (UNCHANGED) ---
+            # This runs based on the tta_blend_target argument
+            collect_stats(model_dict[domain_name], dataloader_dict[domain_name]['train'], 
+                          domain_stats_private, domain_stats_shared, domain_id, args)
+            
+            # --- MIGS STATISTICS COLLECTION (DECOUPLED) ---
+            if args.do_migs:
+                client_migs_stats = collect_migs_stats(model_dict[domain_name], 
+                                                       dataloader_dict[domain_name]['train'])
+                all_clients_migs_stats.append(client_migs_stats)
+
             # NEW: After training, compute local prototypes for this client
             print(f"Computing local prototypes for client {domain_name}...")
             local_protos = compute_local_prototypes(
@@ -340,6 +389,28 @@ def main():
             # --- Standard FedAvg ---
             log_file.info("Performing standard FedAvg...")
             global_avg_shared_params = FedAvg(client_params_to_agg, client_weights)
+
+        # ---> SERVER-SIDE AGGREGATION OF MIGS STATISTICS <---
+        if args.do_migs and all_clients_migs_stats:
+            print("Aggregating local statistics into global MIGS targets...")
+            aggregated_stats = {}
+            layer_keys = all_clients_migs_stats[0].keys()
+            
+            for layer_key in layer_keys:
+                # Weighted sum for the mean and covariance
+                mean_sum = torch.zeros_like(all_clients_migs_stats[0][layer_key]['mean'])
+                cov_sum = torch.zeros_like(all_clients_migs_stats[0][layer_key]['cov'])
+                
+                for client_idx, client_stats in enumerate(all_clients_migs_stats):
+                    client_name = dataobj.train_domain_list[client_idx]
+                    weight = weight_dict[client_name]
+                    mean_sum += client_stats[layer_key]['mean'] * weight # Already on CPU
+                    cov_sum += client_stats[layer_key]['cov'] * weight # Already on CPU
+                
+                aggregated_stats[layer_key] = {'mean': mean_sum, 'cov': cov_sum}
+            
+            global_stats_for_migs = aggregated_stats
+
 
         global_model.load_params(global_avg_shared_params)
         if args.do_fci and local_prototypes_list:

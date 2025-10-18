@@ -13,6 +13,30 @@ from utils.fed_merge import FedAvg
 from network.get_network import GetNetwork, feats_extractor, GradientReversalLayerFn
 # --- END OF MODIFIED LINE ---
 
+# +++ START OF NEW CLASS +++
+class MIGSLoss(torch.nn.Module):
+    def __init__(self, lambda_mean=1.0, lambda_cov=1.0):
+        super().__init__()
+        self.lambda_mean = lambda_mean
+        self.lambda_cov = lambda_cov
+        self.mse_loss = torch.nn.MSELoss()
+        
+    def forward(self, features, global_mean, global_cov):
+        if features.shape[0] < 2: return 0.0
+            
+        global_mean = global_mean.detach()
+        global_cov = global_cov.detach()
+
+        batch_mean = torch.mean(features, dim=0)
+        loss_mean = self.mse_loss(batch_mean, global_mean)
+        
+        centered_features = features - batch_mean
+        batch_cov = (centered_features.T @ centered_features) / (features.shape[0] - 1)
+        loss_cov = self.mse_loss(batch_cov, global_cov)
+        
+        return (self.lambda_mean * loss_mean) + (self.lambda_cov * loss_cov)
+# +++ END OF NEW CLASS +++
+
 def compute_local_prototypes(model, dataloader, num_classes, feature_dim):
     """
     Computes local class prototypes by averaging features for each class.
@@ -122,15 +146,21 @@ def site_only_evaluation(model, dataloader, metric):
     return results_dict
 
 
-def feddgmoe_site_train(comm_rounds, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id, global_prototypes=None):
+def feddgmoe_site_train(comm_rounds, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id, global_prototypes=None, global_stats=None):
     tbar = tqdm(range(args.local_epochs))
     for local_epoch in tbar:
         tbar.set_description(f'{site_name}_train')
-        feddgmoe_epoch_site_train(comm_rounds*args.local_epochs + local_epoch, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id, global_prototypes)
+        feddgmoe_epoch_site_train(comm_rounds*args.local_epochs + local_epoch, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id, global_prototypes, global_stats=global_stats)
 
 # Replace the old feddgmoe_epoch_site_train with this new version
-def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id, global_prototypes=None):
+def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id, global_prototypes=None, global_stats=None):
     model.train()
+
+    # +++ START OF NEW CODE +++
+    # Conditionally create the MIGS loss function if needed
+    migs_loss_fn = MIGSLoss(args.migs_lambda_mean, args.migs_lambda_cov) if args.do_migs else None
+    # +++ END OF NEW CODE +++    
+
     for i, data_list in enumerate(dataloader):
         imgs, labels, _ = data_list
         imgs = imgs.cuda()
@@ -155,6 +185,24 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
                     if not torch.isnan(m.aux_loss) and not torch.isinf(m.aux_loss):
                         loss_aux += m.aux_loss
             loss += args.aux_loss_weight * loss_aux
+
+        # --- NEW: Per-Layer MIGS Loss Application ---
+        if args.do_migs and global_stats is not None and migs_loss_fn is not None:
+            total_migs_loss = 0
+            num_migs_layers = 0
+            for layer_idx, s_feats in s_feats_dict.items():
+                if layer_idx in global_stats:
+                    targets = global_stats[layer_idx]
+                    total_migs_loss += migs_loss_fn(
+                        s_feats, 
+                        targets['mean'].cuda(), 
+                        targets['cov'].cuda()
+                    )
+                    num_migs_layers += 1
+            if i == 0 and (epochs % 1 == 0): # Log first batch
+                print(f"  [ACTIVE] MIGS Loss (Avg): { (total_migs_loss / num_migs_layers).item() if num_migs_layers > 0 else 0 :.4f} over {num_migs_layers} layers")            
+            if num_migs_layers > 0:
+                loss += total_migs_loss / num_migs_layers
 
         # --- 2. Private Trunk "Style Concentration" Loss (Unchanged) ---
         if args.do_adv_private and p_feats is not None and hasattr(model, 'private_domain_discriminator'):
