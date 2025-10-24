@@ -5,107 +5,109 @@ from torch.nn.functional import cosine_similarity
 import re
 import torch
 
-def permute_state_dict(state_dict, permutation_map):
+def permute_state_dict(state_dict, permutation_map, model_prefix=""):
     """
     Permutes the expert weights in a state_dict according to a permutation map.
+    (Final, Direct, Non-Parsing Version with Debugging)
     """
+    print(f"\n--- Running permute_state_dict ---")
     permuted_dict = state_dict.copy()
-    
-    # +++ START DEBUG INJECTION +++
-    # This tripwire checks if the function actually does any work.
-    # If the regex fails, this counter will remain 0.
     num_params_swapped = 0
-    # Also, check if the permutation map is non-trivial. A trivial map isn't a bug.
-    is_map_non_trivial = any(
-        any(i != p_i for i, p_i in enumerate(p))
-        for p in permutation_map.values()
-    )
-    # +++ END DEBUG INJECTION +++
+    total_params_in_scope = 0
 
-    for layer_name, p in permutation_map.items():
-        # p is the permutation for this layer, e.g., [0, 2, 1, 3]
-        for i_orig, i_permuted in enumerate(p):
-            if i_orig == i_permuted:
-                continue # No change needed
-                
-            # Regex to find the expert weights for the original index
-            # This matches keys like '...proj_adapter1_left.0.weight'
-            orig_pattern_left = re.compile(f'({re.escape(layer_name)}\.proj_adapter1_left\.{i_orig}\..*)')
-            orig_pattern_right = re.compile(f'({re.escape(layer_name)}\.proj_adapter1_right\.{i_orig}\..*)')
+    for module_name, p in permutation_map.items():
+        # module_name is the exact prefix, e.g., '0.blocks.4.attn.qkv'
+        full_layer_prefix = module_name
+        print(f"[DEBUG PERMUTE] Processing layer. Searching for parameters with prefix: '{full_layer_prefix}'")
+
+        expert_param_keys = [k for k in state_dict.keys() if k.startswith(full_layer_prefix) and 'proj_adapter' in k]
+        total_params_in_scope += len(expert_param_keys)
+        num_experts = len(p) if 'p' in locals() and p is not None else len(expert_param_keys) // 2
+        print(f"[DEBUG PERMUTE]   - Found {len(expert_param_keys)} param tensors for {num_experts} experts (left/right pairs).")
+        print(f"[DEBUG PERMUTE]   - total_params_in_scope so far: {total_params_in_scope}")
+
+        if not expert_param_keys:
+            print(f"[WARNING PERMUTE] No expert parameters found for layer '{module_name}'. Skipping.")
+            continue
             
-            # Keys for the target permuted index
-            permuted_key_left_str = f'{layer_name}.proj_adapter1_left.{i_permuted}.'
-            permuted_key_right_str = f'{layer_name}.proj_adapter1_right.{i_permuted}.'
-            
-            # Find and swap weights
-            for key in list(permuted_dict.keys()):
-                match_left = orig_pattern_left.match(key)
-                if match_left:
-                    suffix = key[match_left.end(1)-len(str(i_orig)):]
-                    new_key = permuted_key_left_str + suffix
-                    permuted_dict[new_key] = state_dict[key]
-                    # +++ START DEBUG INJECTION +++
-                    num_params_swapped += 1
-                    # +++ END DEBUG INJECTION +++
-                match_right = orig_pattern_right.match(key)
-                if match_right:
-                    suffix = key[match_right.end(1)-len(str(i_orig)):]
-                    new_key = permuted_key_right_str + suffix
-                    permuted_dict[new_key] = state_dict[key]
-                    # +++ START DEBUG INJECTION +++
-                    num_params_swapped += 1
-                    # +++ END DEBUG INJECTION +++
-    # +++ START DEBUG INJECTION +++
-    # The CRITICAL check: If the permutation map required changes, but we swapped nothing,
-    # it means the regex failed to find the parameter names.
-    if is_map_non_trivial and num_params_swapped == 0:
-        print("\n" + "="*80)
-        print("[CRITICAL BUG DETECTED] SILENT FAILURE IN ELMA AGGREGATION!")
-        print("  - FUNCTION: permute_state_dict in fed_merge.py")
-        print("  - REASON: The model's expert parameters could not be found via regex.")
-        print("  - IMPACT: ELMA is NOT working. Experts are being averaged incorrectly,")
-        print("            which will degrade model performance and invalidate results.")
-        print("  - LIKELY CAUSE: The internal naming of the MoE layers in 'lora_util.py'")
-        print("                  has changed, breaking the hardcoded regex patterns here.")
-        print("="*80 + "\n")
-    # +++ END DEBUG INJECTION +++
+        temp_layer_params = {}
+        for key in expert_param_keys:
+            # Match the expert index at the VERY END of the string
+            match = re.search(r'\.(\d+)$', key) 
+            if match:
+                i_orig = int(match.group(1))
+                if i_orig < len(p):
+                    i_permuted = p[i_orig]
+                    
+                    if i_orig != i_permuted:
+                        orig_suffix = f".{i_orig}"
+                        permuted_suffix = f".{i_permuted}"
+                        new_key = key[:-len(orig_suffix)] + permuted_suffix
+                        
+                        temp_layer_params[new_key] = state_dict[key]
+                        num_params_swapped += 1
+                        print(f"[DEBUG PERMUTE]   - Remapping '{key}' -> '{new_key}'")
+                    else:
+                        # No change, map key to itself
+                        temp_layer_params[key] = state_dict[key]
+                else:
+                    temp_layer_params[key] = state_dict[key]
+        
+        permuted_dict.update(temp_layer_params)
+
+    # Final summary log
+    print(f"--- Finished permutation ---")
+    if total_params_in_scope > 0:
+        if num_params_swapped > 0:
+            print(f"[INFO ELMA - PERMUTATION] Successfully remapped {num_params_swapped} / {total_params_in_scope} expert parameters.")
+        else:
+            print(f"[INFO ELMA - PERMUTATION] All experts were already aligned. No parameters remapped.")
+    elif len(permutation_map) > 0:
+        print(f"[ERROR ELMA - PERMUTATION] Found 0 total expert parameters across all layers. Check module discovery logic.")
+    print("") # Newline for readability
+
     return permuted_dict
 
-def ExpertMatchedAvg(client_states, client_weights, global_reps, client_reps, args):
+def ExpertMatchedAvg(client_states, client_weights, reference_reps, client_reps, args):
     """
-    Performs Expert-Level Matched Aggregation (ELMA).
+    Performs Expert-Level Matched Aggregation (ELMA) by aligning each client
+    to a common set of reference expert representations.
     """
     permuted_client_states = []
-    all_permutation_maps = [] # <--- New list to store maps    
-    # Iterate through each client
+    all_permutation_maps = []
+    
     for client_idx, client_state in enumerate(client_states):
-        client_rep = client_reps[client_idx]
+        client_rep_to_match = client_reps[client_idx]
+        print(f"[INFO ELMA] Processing Client client_rep_to_match {client_idx} for ELMA.")
+        print(f"[DEBUG ELMA] Client {client_idx} layers available for matching: {list(client_rep_to_match.keys())}")
         permutation_map = {}
         
-        # For each MoE layer that has a representation
-        for layer_name, global_expert_reps in global_reps.items():
-            if layer_name not in client_rep:
+        for layer_name, ref_expert_reps in reference_reps.items():
+            if layer_name not in client_rep_to_match:
+                print(f"[WARNING ELMA] Layer '{layer_name}' not found in client {client_idx} representations. Skipping.")
                 continue
             
-            client_expert_reps = client_rep[layer_name]
+            client_expert_reps = client_rep_to_match[layer_name]
             
-            # Create a cost matrix based on cosine distance (1 - similarity)
-            num_experts = global_expert_reps.shape[0]
+            num_experts = ref_expert_reps.shape[0]
             cost_matrix = torch.zeros((num_experts, num_experts))
             for i in range(num_experts):
                 for j in range(num_experts):
-                    cost_matrix[i, j] = 1 - cosine_similarity(global_expert_reps[i].unsqueeze(0), client_expert_reps[j].unsqueeze(0))
-            
-            # Solve the assignment problem to find the optimal matching
+                    cost_matrix[i, j] = 1 - cosine_similarity(ref_expert_reps[i].unsqueeze(0), client_expert_reps[j].unsqueeze(0))
+            print(f"[DEBUG ELMA] Cost matrix for layer '{layer_name}' (Client {client_idx}):\n{cost_matrix.numpy()}")
+
             row_ind, col_ind = linear_sum_assignment(cost_matrix.numpy())
-            permutation_map[layer_name] = col_ind # col_ind[i] is the client expert that matches global expert i
-        all_permutation_maps.append(permutation_map) # Store the map
-        # Permute the client's state_dict according to the map
+            print(f"[DEBUG ELMA] Optimal assignment for layer '{layer_name}' (Client {client_idx}): {list(zip(row_ind, col_ind))}")
+            permutation_map[layer_name] = col_ind
+
+        all_permutation_maps.append(permutation_map)
+        
         permuted_state = permute_state_dict(client_state, permutation_map)
         permuted_client_states.append(permuted_state)
         
-    # Perform standard FedAvg on the now-aligned states
     return FedAvg(permuted_client_states, client_weights), all_permutation_maps
+
+
 
 def Dict_weight(dict_in, weight_in):
     for k,v in dict_in.items():

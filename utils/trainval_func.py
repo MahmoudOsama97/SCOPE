@@ -8,10 +8,53 @@ import random
 from network.get_network import feats_extractor
 import copy
 from utils.fed_merge import FedAvg
+from utils.lora_util import K_Linear_MoE_new_ # <-- Make sure to import the MoE class
+
 # --- START OF MODIFIED LINE ---
 # Import the GRL class from where it is defined
 from network.get_network import GetNetwork, feats_extractor, GradientReversalLayerFn
 # --- END OF MODIFIED LINE ---
+
+# +++ START OF NEW FUNCTION +++
+def ExpertDiversityLoss(model):
+    """
+    Calculates the intra-client expert diversity loss.
+
+    This loss encourages the experts within each MoE layer of a model to learn
+    distinct functions by penalizing the cosine similarity between their weight vectors.
+    """
+    total_diversity_loss = 0
+    num_moe_layers = 0
+    
+    # Iterate through all modules in the model to find the MoE layers
+    for module in model.modules():
+        # Check if the module is our specific MoE adapter class
+        if isinstance(module, K_Linear_MoE_new_):
+            # Use the new helper method to get all expert weight vectors for this layer
+            expert_signatures = module.get_expert_signatures() # Shape: [num_experts, D]
+            
+            # Normalize the signatures to make cosine similarity calculation efficient
+            expert_signatures_norm = F.normalize(expert_signatures, p=2, dim=1)
+            
+            # Calculate the Gram matrix (matrix of all-pairs cosine similarities)
+            # This is much more efficient than a double for-loop.
+            # Resulting shape: [num_experts, num_experts]
+            cosine_sim_matrix = torch.mm(expert_signatures_norm, expert_signatures_norm.t())
+            
+            # We want to penalize similarity, so we want the sum of the matrix to be low.
+            # We only sum the upper triangle of the matrix (excluding the diagonal)
+            # to avoid double-counting pairs (i,j) and (j,i) and self-similarity (i,i).
+            # The diagonal will always be 1, so we subtract num_experts to remove it.
+            loss_for_this_layer = (torch.sum(cosine_sim_matrix) - module.n) / 2.0
+            
+            total_diversity_loss += loss_for_this_layer
+            num_moe_layers += 1
+
+    # Average the loss across all MoE layers found
+    if num_moe_layers > 0:
+        return total_diversity_loss / num_moe_layers
+    else:
+        return 0.0
 
 # +++ START OF NEW CLASS +++
 class MIGSLoss(torch.nn.Module):
@@ -172,7 +215,8 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
 
         # +++ START DEBUG INJECTION: LOSS COMPONENT LOGGING +++
         # At the start of each batch, create a small dictionary to hold loss values for logging
-        if i == 0 and (epochs % 1 == 0): # Log only for the first batch of every N epochs
+        log_this_batch = (i == 0 and epochs % 1 == 0) # Helper flag for clarity
+        if log_this_batch: # Log only for the first batch of every N epochs
              print(f"\n--- Loss Health Check (Epoch {epochs}, Site '{site_name}') ---")
         # +++ END DEBUG INJECTION +++
 
@@ -186,23 +230,46 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
                         loss_aux += m.aux_loss
             loss += args.aux_loss_weight * loss_aux
 
-        # --- NEW: Per-Layer MIGS Loss Application ---
+     # --- NEW: Intra-Client Expert Diversity Loss ---
+        if args.do_expert_div:
+            loss_expert_div = ExpertDiversityLoss(model)
+            # We add this to the total loss, scaled by its lambda
+            loss += args.expert_div_lambda * loss_expert_div
+
+            # It's good practice to log this component separately to monitor it
+            if i == 0 and (epochs % 1 == 0): # Log for the first batch of an epoch
+                print(f"  [ACTIVE] Expert Diversity Loss: {loss_expert_div.item():.4f}")
+
+        # --- 2. Per-Layer MIGS Loss Application ---
         if args.do_migs and global_stats is not None and migs_loss_fn is not None:
             total_migs_loss = 0
             num_migs_layers = 0
             for layer_idx, s_feats in s_feats_dict.items():
                 if layer_idx in global_stats:
                     targets = global_stats[layer_idx]
+                    # This loss is calculated for every batch
                     total_migs_loss += migs_loss_fn(
                         s_feats, 
                         targets['mean'].cuda(), 
                         targets['cov'].cuda()
                     )
                     num_migs_layers += 1
-            if i == 0 and (epochs % 1 == 0): # Log first batch
-                print(f"  [ACTIVE] MIGS Loss (Avg): { (total_migs_loss / num_migs_layers).item() if num_migs_layers > 0 else 0 :.4f} over {num_migs_layers} layers")            
+            
+            # This is the actual logic - it must always run
             if num_migs_layers > 0:
-                loss += total_migs_loss / num_migs_layers
+                avg_migs_loss = total_migs_loss / num_migs_layers
+                loss += avg_migs_loss
+
+            # This is the debug log - it only runs for the first batch
+            if log_this_batch:
+                if num_migs_layers > 0:
+                    print(f"  [ACTIVE] MIGS Loss (Avg): {avg_migs_loss.item():.4f} across {num_migs_layers} layers")
+                else:
+                    print("  [SKIPPED] MIGS Loss: No matching layers found in global_stats.")
+        
+        elif log_this_batch and args.do_migs:
+             # This log tells you WHY MIGS was skipped
+             print(f"  [SKIPPED] MIGS Loss: The 'global_stats' object is None. (Note: This is normal for the first round).")
 
         # --- 2. Private Trunk "Style Concentration" Loss (Unchanged) ---
         if args.do_adv_private and p_feats is not None and hasattr(model, 'private_domain_discriminator'):

@@ -63,7 +63,10 @@ for domain in "${domains[@]}"; do
         --local_epochs 10 \
         --comm 10 \
         --private_blocks_count 4 \
-        --where ALL_qkv \
+        --do_migs \
+        --migs_lambda_mean 10 \
+        --migs_lambda_cov 10 \
+        --tta_blend_target layer_wise \
         --note "baseline"
 done
 

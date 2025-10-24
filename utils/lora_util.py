@@ -135,13 +135,13 @@ class K_Linear_MoE_new_(nn.Linear, LoRALayer):
             for i in range(self.n):
                 self.proj_adapter1_left.append(
                     nn.Parameter(
-                        torch.Tensor(size=(phm_dim, self._in_feats_per_axis, self.phm_rank * (2**i))),
+                        torch.Tensor(size=(phm_dim, self._in_feats_per_axis, self.phm_rank * 8)),
                         requires_grad=True,
                     )
                 )
                 self.proj_adapter1_right.append(
                     nn.Parameter(
-                        torch.Tensor(size=(phm_dim, self.phm_rank * (2**i), self._out_feats_per_axis)),
+                        torch.Tensor(size=(phm_dim, self.phm_rank * 8, self._out_feats_per_axis)),
                         requires_grad=True,
                     )
                 )
@@ -158,7 +158,26 @@ class K_Linear_MoE_new_(nn.Linear, LoRALayer):
 
     def reset_parameters(self):
         nn.Linear.reset_parameters(self)
-        # self.init_W()
+
+# In lora_util.py -> K_Linear_MoE_new_ class
+
+    def get_expert_signatures(self):
+        """
+        Returns a tensor containing the flattened weight vectors of all experts in this layer.
+        Shape: [num_experts, flattened_feature_dim]
+        """
+        signatures = []
+        for i in range(self.n): # self.n is the number of experts
+            left_param = self.proj_adapter1_left[i]
+            right_param = self.proj_adapter1_right[i]
+            
+            # Concatenate the left and right parameter vectors to form the full signature
+            # --- FIX: REMOVED .data TO KEEP TENSORS IN THE COMPUTATION GRAPH ---
+            signature_vector = torch.cat([left_param.flatten(), right_param.flatten()])
+            signatures.append(signature_vector)
+        
+        # Stack them into a single tensor
+        return torch.stack(signatures)
 
     def init_W(self):
         for j in range(self.n):

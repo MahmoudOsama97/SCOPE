@@ -129,6 +129,11 @@ class FedWrapper(nn.Module):
             print("[DEBUG] --> Orthogonality Loss: ENABLED")
         print("[DEBUG] FedWrapper initialization complete.\n")
 
+    @property
+    def param_prefix(self):
+        # This is the name of the attribute holding the nn.Sequential model
+        return "model"
+
     def _create_hook(self, name):
         """Creates a hook function that saves the output of a module."""
         def hook(model, input, output):

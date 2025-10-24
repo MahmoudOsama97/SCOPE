@@ -63,8 +63,9 @@ for domain in "${domains[@]}"; do
         --local_epochs 10 \
         --comm 10 \
         --private_blocks_count 4 \
-        --agg_strategy fedavg \
-        --tta_blend_target none \
+        --do_migs \
+        --migs_lambda_mean 10 \
+        --migs_lambda_cov 10 \
         --note "baseline"
 done
 

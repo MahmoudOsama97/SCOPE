@@ -2,7 +2,7 @@ import os
 import sys
 # Add the parent directories to the Python path to allow for package-like imports
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
-
+import re
 import argparse
 from network.get_network import GetNetwork, feats_extractor
 from torch.utils.tensorboard.writer import SummaryWriter
@@ -24,20 +24,107 @@ from utils.domain_stats.offline.offline_gmm import OfflineGMMTracker
 from utils.domain_stats.offline.offline_mahalanobis import OfflineMahalanobisTracker
 from utils.domain_stats.offline.offline_cosine import OfflineCosineTracker, OfflineCosineMuVarTracker, OfflineCosineConcat
 from utils.lora_util import CosineTopKGate
-# Create a new helper function before main()
-# Replace the entire old function with this new version.
-def generate_expert_representations(model):
+
+# Replace the old version of this function with this new, definitive version.
+def extract_expert_weights_as_vectors(model, include_private=False):
+    """
+    Extracts the flattened, concatenated weights of each expert in each MoE layer.
+    (Final, Direct, Non-Parsing Version with Debugging)
+    """
+    print(f"\n--- Running extract_expert_weights_as_vectors (include_private={include_private}) ---")
+    expert_signatures = {}
+    private_blocks_count = model.private_blocks_count
+
+    # Iterate through the model's modules to find the MoE adapters directly
+    for module_name, module in model.model.named_modules():
+        # Check if the module is the specific MoE adapter class we are using
+        if 'K_Linear_MoE_new_' in module.__class__.__name__:
+            print(f"[DEBUG EXTRACT] Found MoE module: '{module_name}'")
+            
+            # --- TRUNK AWARENESS LOGIC ---
+            try:
+                block_num = int(re.search(r'blocks\.(\d+)', module_name).group(1))
+                print(f"[DEBUG EXTRACT]   - Parsed block number: {block_num}")
+
+                if block_num < private_blocks_count and not include_private:
+                    print(f"[DEBUG EXTRACT]   - SKIPPING (Private Trunk)")
+                    continue 
+                else:
+                    print(f"[DEBUG EXTRACT]   - INCLUDING (Public Trunk or include_private=True)")
+            except (AttributeError, IndexError, ValueError):
+                print(f"[WARNING EXTRACT] Could not determine block number for module: {module_name}. Skipping.")
+                continue
+            
+            # --- EXTRACT PARAMETERS DIRECTLY ---
+            layer_map_key = module_name 
+            
+            temp_vectors = []
+            for i in range(module.n): # module.n is the number of experts
+                left_param = module.proj_adapter1_left[i]
+                right_param = module.proj_adapter1_right[i]
+                
+                signature_vector = torch.cat([left_param.data.flatten(), right_param.data.flatten()])
+                temp_vectors.append(signature_vector.detach().cpu())
+                print(f"[DEBUG EXTRACT]   - Expert {i}: signature vector created with size {signature_vector.shape[0]}")
+            
+            if not temp_vectors:
+                continue
+
+            max_len = max(v.shape[0] for v in temp_vectors)
+            print(f"[DEBUG EXTRACT]   - Max signature length for this layer: {max_len}")
+
+            padded_vectors = []
+            for i, v in enumerate(temp_vectors):
+                padding_needed = max_len - v.shape[0]
+                if padding_needed > 0:
+                    padded_v = F.pad(v, (0, padding_needed), 'constant', 0)
+                    padded_vectors.append(padded_v)
+                    print(f"[DEBUG EXTRACT]   - Padded Expert {i} vector to size {padded_v.shape[0]}")
+                else:
+                    padded_vectors.append(v)
+            
+            expert_signatures[layer_map_key] = torch.stack(padded_vectors)
+            print(f"[DEBUG EXTRACT]   -> Successfully created signature matrix of size: {expert_signatures[layer_map_key].shape}")
+            
+    print(f"--- Finished extraction. Found signatures for {len(expert_signatures)} public layers. ---\n")
+    return expert_signatures
+
+def generate_expert_representations(model, include_private=False):
     """
     Directly extracts the expert representation vectors from the `sim_matrix`
     parameter of each CosineTopKGate in the model.
+    
+    Args:
+        model: The FedWrapper model.
+        include_private (bool): If False, only returns representations from the public trunk.
     """
     expert_representations = {}
+    private_blocks_count = model.private_blocks_count
+    
     # Search within the wrapped model for the routers
     for name, module in model.model.named_modules():
         if isinstance(module, CosineTopKGate):
-            # The sim_matrix has shape [proj_dim, num_experts].
-            # We want each expert's representation, which is a column.
-            # Transposing gives us shape [num_experts, proj_dim], which is what we need.
+            # --- NEW: TRUNK AWARENESS LOGIC ---
+            is_private = False
+            # Check if this router belongs to a private block
+            if '.blocks.' in name:
+                try:
+                    block_num_str = name.split('.blocks.')[1].split('.')[0]
+                    block_num = int(block_num_str)
+                    if block_num < private_blocks_count:
+                        is_private = True
+                except (IndexError, ValueError):
+                    print(f"[WARNING ELMA] Could not parse block number from router name: {name}")
+                    pass # Not a block parameter we need to worry about
+                    
+
+            if is_private and not include_private:
+                print(f"[INFO ELMA] Skipping private trunk router: {name}")
+                continue # Skip this router if it's in the private trunk
+                
+            # --- END OF NEW LOGIC ---
+
+            # The sim_matrix has shape [proj_dim, num_experts]. Transpose to get [num_experts, proj_dim].
             expert_representations[name] = module.sim_matrix.T.detach().cpu()
             
     return expert_representations
@@ -145,8 +232,12 @@ def get_argparse():
     parser.add_argument('--lr', help='learning rate', type=float, default=0.001)
     parser.add_argument("--lr_policy", type=str, default='step', choices=['step'],
                         help="learning rate scheduler policy")
-    parser.add_argument('--agg_strategy', type=str, default='fedavg', choices=['fedavg', 'elma'],
+    parser.add_argument('--agg_strategy', type=str, default='fedavg', choices=['fedavg', 'elma', 'elma_prob_anchor'],
                         help='The server-side aggregation strategy to use.')
+    # +++ NEW ARGUMENT +++
+    parser.add_argument('--elma_temp', type=float, default=0.5, 
+                        help='Temperature for probabilistic anchor selection in ELMA. Low values are greedy, high values are uniform.')
+
     ## tracker args
     parser.add_argument('--domain_tracker', help='Which domain stats tracker to use', type=str, default='offline_cosine_muvar',
                        choices=['offline_cosine_muvar', 'offline_cosine', 'offline_mahalanobis', 
@@ -172,7 +263,12 @@ def get_argparse():
     parser.add_argument('--use_prior', help='Use weight_dict as prior distribution for similarities', action='store_true')
     parser.add_argument('--prior_strength', help='Strength of the prior distribution (higher values give more weight to prior)', type=float, default=1.0)
     # parser.add_argument('--expert_rank', type=int, default=8, help='expert rank for the MoE layer')
-    # +++ START OF NEW CODE +++
+    # --- Intra-Client Expert Diversity Regularization ---
+    parser.add_argument('--do_expert_div', action='store_true', 
+                        help='Enable Intra-Client Expert Diversity Regularization loss to encourage expert specialization.')
+    parser.add_argument('--expert_div_lambda', type=float, default=0.01, 
+                        help='Weight for the expert diversity regularization loss.')    
+
     # --- Mutual Information Gradient Stopper (MIGS) Loss Arguments ---
     parser.add_argument('--do_migs', action='store_true', help='Enable the layer-wise Mutual Information Gradient Stopper (MIGS) loss.')
     parser.add_argument('--migs_lambda_mean', type=float, default=0.1, help='Weight for the MIGS mean alignment loss.')
@@ -206,7 +302,7 @@ def get_argparse():
 
     # +++ END OF NEW CODE +++
     # misc args
-    parser.add_argument('--aux_loss_weight', type=float, default=0.01, help='Weight for the MoE auxiliary loss. Set to 0 to disable.')
+    parser.add_argument('--aux_loss_weight', type=float, default=0.1, help='Weight for the MoE auxiliary loss. Set to 0 to disable.')
     parser.add_argument('--note', help='note of experimental settings', type=str, default='feddg_moe')
     parser.add_argument('--display', help='display in controller', action='store_true')
     return parser.parse_args()
@@ -292,7 +388,8 @@ def main():
     
     domain_stats_private = create_tracker(args)
     domain_stats_shared = None # This will hold either a single tracker or a dict
-
+    # Initialize global stats for MIGS
+    global_stats_for_migs = None 
     if args.tta_blend_target == 'layer_wise':
         domain_stats_shared = {
             i: create_tracker(args) for i in shared_adapter_indices
@@ -322,6 +419,11 @@ def main():
 
         # 2. Local Training and NEW Local Prototype Computation
         local_prototypes_list = []
+        # +++ START MIGS MODIFICATION +++
+        all_clients_migs_stats = []
+        # +++ END MIGS MODIFICATION +++
+        # +++ NEW: List to store client validation accuracies +++
+        client_accuracies = []    
         for domain_id, domain_name in enumerate(dataobj.train_domain_list):
             feddgmoe_site_train(i, domain_name, args, model_dict[domain_name], optimizer_dict[domain_name], 
                       scheduler_dict[domain_name], dataloader_dict[domain_name]['train'], log_ten, metric, domain_id, global_prototypes=global_prototypes, global_stats=global_stats_for_migs if args.do_migs else None)
@@ -348,8 +450,8 @@ def main():
             )
             local_prototypes_list.append(local_protos)            
             # Optional: You can still evaluate the performance of each full client model
-            site_evaluation(i, domain_name, args, model_dict[domain_name], dataloader_dict[domain_name]['val'], log_file, log_ten, metric, note='before_fed')
-
+            results_dict = site_evaluation(i, domain_name, args, model_dict[domain_name], dataloader_dict[domain_name]['val'], log_file, log_ten, metric, note='before_fed')
+            client_accuracies.append(results_dict['acc'])
         # 3. Aggregation: Collect shared params and average them into the global model
         strategies_that_do_not_aggregate_private_trunk = ['global_private', 'layer_wise']
         include_private_in_agg = (args.tta_blend_target not in strategies_that_do_not_aggregate_private_trunk)
@@ -364,25 +466,61 @@ def main():
         
         client_weights = [weight_dict[name] for name in dataobj.train_domain_list]
 
-        if args.agg_strategy == 'elma':
+        if args.agg_strategy == 'elma_prob_anchor':
+            log_file.info("Performing Probabilistic Anchor ELMA...")
+            print("Performing Probabilistic Anchor ELMA...")
+            # GUARD RAIL 1: Check if the accuracy list is empty.
+            if not client_accuracies:
+                print("Client accuracy list is empty. Cannot perform anchor selection. ")
+            # 1. Select the Anchor Client
+            acc_tensor = torch.tensor(client_accuracies)
+            # GUARD RAIL 2: Check for NaN values in the accuracy scores.
+            if torch.isnan(acc_tensor).any():
+                print("NaN detected in client accuracies. Cannot compute a valid probability distribution. ")
+
+            # GUARD RAIL 3: Check for division by zero.
+            if args.elma_temp <= 0:
+                print(f"ELMA temperature must be positive, but got {args.elma_temp}.")            
+
+            # Apply softmax with temperature
+            probabilities = F.softmax(acc_tensor / args.elma_temp, dim=0)
+            
+            # Sample one client index to be the anchor
+            anchor_client_idx = torch.multinomial(probabilities, 1).item()
+            anchor_client_name = dataobj.train_domain_list[anchor_client_idx]
+            log_file.info(f"  Selected '{anchor_client_name}' as anchor for this round (Accuracy: {client_accuracies[anchor_client_idx]*100:.2f}%)")
+            print(f"  Selected '{anchor_client_name}' as anchor for this round (Accuracy: {client_accuracies[anchor_client_idx]*100:.2f}%)")
+
+            # 2. Prepare inputs for ExpertMatchedAvg
+            client_reps = [extract_expert_weights_as_vectors(model_dict[name], include_private=False) for name in dataobj.train_domain_list]
+            reference_reps = client_reps[anchor_client_idx] # The anchor's reps are the reference
+            
+            # 3. Call the refactored function
+            global_avg_shared_params, permutation_maps = ExpertMatchedAvg(client_params_to_agg, client_weights, reference_reps, client_reps, args)
+
+        elif args.agg_strategy == 'elma':
             # --- ELMA Strategy ---
             log_file.info("Performing Expert-Level Matched Aggregation (ELMA)...")
-            # Generate representations for the global model and all clients
-            global_reps = generate_expert_representations(global_model)
-            client_reps = [generate_expert_representations(model_dict[name]) for name in dataobj.train_domain_list]
-            # Call the new aggregation function
+            
+            # --- MODIFIED LINES: Only get PUBLIC representations ---
+            global_reps = extract_expert_weights_as_vectors(global_model, include_private=False)
+            client_reps = [extract_expert_weights_as_vectors(model_dict[name], include_private=False) for name in dataobj.train_domain_list]
+            # --- END OF MODIFIED LINES ---
+
+            # Now, ELMA will only operate on the public trunk experts.
             global_avg_shared_params, permutation_maps = ExpertMatchedAvg(client_params_to_agg, client_weights, global_reps, client_reps, args)
-        # +++ DEBUG PRINT +++
             # Check the permutation for the first client and a sample layer to see if it's working
             first_client_perms = permutation_maps[0]
             sample_layer = list(first_client_perms.keys())[0] if first_client_perms else None
             if sample_layer:
                 perm_string = str(first_client_perms[sample_layer])
                 log_file.info(f"[DEBUG ELMA] Round {i}, Client 0, Sample Layer '{sample_layer}' Permutation: {perm_string}")
+                print(f"[DEBUG ELMA] Round {i}, Client 0, Sample Layer '{sample_layer}' Permutation: {perm_string}")
                 # Check for silent failure
                 identity_perm = list(range(len(first_client_perms[sample_layer])))
                 if list(first_client_perms[sample_layer]) == identity_perm:
                     log_file.warning(f"[WARNING ELMA] Permutation for client 0 is the identity. ELMA may not be effective.")
+                    print(f"[WARNING ELMA] Permutation for client 0 is the identity. ELMA may not be effective.")
             # +++ END DEBUG +++        
         
         else:
@@ -422,7 +560,6 @@ def main():
         for domain_name in dataobj.train_domain_list:
             results_dict = site_evaluation(i, domain_name, args, global_model, dataloader_dict[domain_name]['val'], log_file, log_ten, metric)
             fed_val += results_dict['acc'] * weight_dict[domain_name]
-        
         if fed_val >= best_val:
             # ... (Saving checkpoints logic is fine, but save global_model)
             SaveCheckPoint(args, global_model, args.comm, os.path.join(log_dir, 'checkpoints'), note='best_val_model')

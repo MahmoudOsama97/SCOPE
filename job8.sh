@@ -63,7 +63,9 @@ for domain in "${domains[@]}"; do
         --local_epochs 10 \
         --comm 10 \
         --private_blocks_count 4 \
-        --agg_strategy elma \
+        --do_migs \
+        --migs_lambda_mean 5 \
+        --migs_lambda_cov 5 \
         --note "baseline"
 done
 
