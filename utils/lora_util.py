@@ -135,13 +135,13 @@ class K_Linear_MoE_new_(nn.Linear, LoRALayer):
             for i in range(self.n):
                 self.proj_adapter1_left.append(
                     nn.Parameter(
-                        torch.Tensor(size=(phm_dim, self._in_feats_per_axis, self.phm_rank * 8)),
+                        torch.Tensor(size=(phm_dim, self._in_feats_per_axis, self.phm_rank * (2**i))),
                         requires_grad=True,
                     )
                 )
                 self.proj_adapter1_right.append(
                     nn.Parameter(
-                        torch.Tensor(size=(phm_dim, self.phm_rank * 8, self._out_feats_per_axis)),
+                        torch.Tensor(size=(phm_dim, self.phm_rank * (2**i), self._out_feats_per_axis)),
                         requires_grad=True,
                     )
                 )
@@ -164,7 +164,9 @@ class K_Linear_MoE_new_(nn.Linear, LoRALayer):
     def get_expert_signatures(self):
         """
         Returns a tensor containing the flattened weight vectors of all experts in this layer.
-        Shape: [num_experts, flattened_feature_dim]
+        If experts have different ranks (and thus sizes), smaller signatures are padded
+        with zeros to match the largest one.
+        Shape: [num_experts, max_flattened_feature_dim]
         """
         signatures = []
         for i in range(self.n): # self.n is the number of experts
@@ -172,12 +174,31 @@ class K_Linear_MoE_new_(nn.Linear, LoRALayer):
             right_param = self.proj_adapter1_right[i]
             
             # Concatenate the left and right parameter vectors to form the full signature
-            # --- FIX: REMOVED .data TO KEEP TENSORS IN THE COMPUTATION GRAPH ---
             signature_vector = torch.cat([left_param.flatten(), right_param.flatten()])
             signatures.append(signature_vector)
         
-        # Stack them into a single tensor
-        return torch.stack(signatures)
+        # --- START OF FIX ---
+        # 1. Check if all signatures are the same size. If so, stack directly.
+        if all(s.shape == signatures[0].shape for s in signatures):
+            return torch.stack(signatures)
+
+        # 2. If sizes are different, find the max size and pad the smaller ones.
+        max_len = max(s.shape[0] for s in signatures)
+        
+        padded_signatures = []
+        for s in signatures:
+            padding_needed = max_len - s.shape[0]
+            if padding_needed > 0:
+                # F.pad takes a tuple of (padding_before, padding_after)
+                # We want to pad only at the end.
+                padded_s = F.pad(s, (0, padding_needed), 'constant', 0)
+                padded_signatures.append(padded_s)
+            else:
+                padded_signatures.append(s) # It's already the max size
+        
+        # 3. Stack the now equally-sized padded tensors.
+        return torch.stack(padded_signatures)
+        # --- END OF FIX ---```
 
     def init_W(self):
         for j in range(self.n):
@@ -932,7 +953,7 @@ def inject_trainable_moe_kronecker_new(
 
                     require_grad_params.append(_module._modules[name].router.parameters())
                     require_grad_params.append(_module._modules[name].b_adapter.parameters())
-
+                    # require_grad_params.append(_module._modules[name].parameters())
                     names.append(name)
                     for key, value in k.items():
                         setattr(_module._modules[name], key, value)

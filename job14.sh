@@ -66,9 +66,9 @@ for domain in "${domains[@]}"; do
         --do_migs \
         --migs_lambda_mean 10 \
         --migs_lambda_cov 10 \
-        --agg_strategy elma_prob_anchor \
+        --agg_strategy elma \
         --do_expert_div \
-        --expert_div_lambda 5.0 \
+        --expert_div_lambda 1.0 \  
         --note "baseline"
 done
 

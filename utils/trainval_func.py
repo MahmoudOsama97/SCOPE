@@ -400,8 +400,23 @@ def GetFedModel(args, num_classes, is_train=True):
     for domain_name in domain_list:
         model_dict[domain_name], _ = GetNetwork(args, num_classes, is_train)
         model_dict[domain_name] = model_dict[domain_name].cuda()
+
+
         optimizer_dict[domain_name] = torch.optim.SGD(model_dict[domain_name].parameters(), lr=args.lr, momentum=0.9,
                                                       weight_decay=5e-4)
+        # --- START OF FIX: SWITCH TO ADAM OPTIMIZER ---
+        # Adam is often a better choice for adapter-based tuning.
+        # It adapts the learning rate for each parameter individually.
+        # A good default learning rate for Adam is often lower than for SGD.
+        # A weight decay of 0 is common for Adam, but a small value can be used for regularization.
+        # optimizer_dict[domain_name] = torch.optim.Adam(
+        #     model_dict[domain_name].parameters(), 
+        #     lr=args.lr, 
+        #     betas=(0.9, 0.999), 
+        #     weight_decay=5e-4 
+        # )
+        # --- END OF FIX ---
+
         total_epochs = args.local_epochs * args.comm
         if args.lr_policy == 'step':
             scheduler_dict[domain_name] = torch.optim.lr_scheduler.StepLR(optimizer_dict[domain_name], step_size=int(total_epochs *0.8), gamma=0.1)

@@ -25,6 +25,37 @@ from utils.domain_stats.offline.offline_mahalanobis import OfflineMahalanobisTra
 from utils.domain_stats.offline.offline_cosine import OfflineCosineTracker, OfflineCosineMuVarTracker, OfflineCosineConcat
 from utils.lora_util import CosineTopKGate
 
+# +++ START OF NEW DEBUG FUNCTION +++
+def debug_expert_representations(model, site_name, stage=""):
+    """
+    Prints summary statistics (L2 Norm) for each expert in the model's MoE layers.
+    Returns a dictionary of the full representations for later comparison.
+    """
+    print(f"\n--- DEBUG: Expert Representations for site '{site_name}' ({stage}) ---")
+    
+    # Store representations to return them for calculating the delta
+    representations = {}
+    
+    # Find all the MoE layers in the model
+    for name, module in model.model.named_modules():
+        if 'K_Linear_MoE_new_' in module.__class__.__name__:
+            # Use the helper method to get the [num_experts, D] tensor of weights
+            expert_signatures = module.get_expert_signatures()
+            representations[name] = expert_signatures.detach().cpu().clone()
+            
+            print(f"  Layer '{name}':")
+            for i in range(expert_signatures.shape[0]):
+                expert_vec = expert_signatures[i]
+                # The L2 norm is the magnitude of the vector. A good single-number summary.
+                norm = torch.norm(expert_vec).item()
+                print(f"    - Expert {i}: L2 Norm = {norm:.6f}")
+                
+    return representations
+# +++ END OF NEW DEBUG FUNCTION +++
+
+
+
+
 # Replace the old version of this function with this new, definitive version.
 def extract_expert_weights_as_vectors(model, include_private=False):
     """
@@ -302,7 +333,7 @@ def get_argparse():
 
     # +++ END OF NEW CODE +++
     # misc args
-    parser.add_argument('--aux_loss_weight', type=float, default=0.1, help='Weight for the MoE auxiliary loss. Set to 0 to disable.')
+    parser.add_argument('--aux_loss_weight', type=float, default=1.0, help='Weight for the MoE auxiliary loss. Set to 0 to disable.')
     parser.add_argument('--note', help='note of experimental settings', type=str, default='feddg_moe')
     parser.add_argument('--display', help='display in controller', action='store_true')
     return parser.parse_args()
@@ -395,9 +426,11 @@ def main():
             i: create_tracker(args) for i in shared_adapter_indices
         }
         log_file.info(f"Initialized L-TTA trackers for shared layers: {shared_adapter_indices}")
+        print(f"Initialized L-TTA trackers for shared layers: {shared_adapter_indices}")
     else:
         domain_stats_shared = create_tracker(args)
         log_file.info(f"Initialized a single shared tracker for TTA strategy: '{args.tta_blend_target}'")
+        print(f"Initialized a single shared tracker for TTA strategy: '{args.tta_blend_target}'")
 
     # Simplified stats collection function selection
     collect_stats = collect_offline_stats if 'offline_' in args.domain_tracker else collect_online_stats
@@ -425,10 +458,25 @@ def main():
         # +++ NEW: List to store client validation accuracies +++
         client_accuracies = []    
         for domain_id, domain_name in enumerate(dataobj.train_domain_list):
+
+            reps_before = debug_expert_representations(model_dict[domain_name], domain_name, stage="Before Local Training")     
+
             feddgmoe_site_train(i, domain_name, args, model_dict[domain_name], optimizer_dict[domain_name], 
                       scheduler_dict[domain_name], dataloader_dict[domain_name]['train'], log_ten, metric, domain_id, global_prototypes=global_prototypes, global_stats=global_stats_for_migs if args.do_migs else None)
             
-
+            reps_after = debug_expert_representations(model_dict[domain_name], domain_name, stage="After Local Training")
+            # 3. Calculate and print the DELTA (the change in weights)
+            print(f"\n--- DEBUG: Expert Weight Change for site '{domain_name}' (Round {i}) ---")
+            for layer_name in reps_before.keys():
+                # Calculate the difference vector for each expert
+                diff_tensor = reps_after[layer_name] - reps_before[layer_name]
+                
+                print(f"  Layer '{layer_name}':")
+                for expert_idx in range(diff_tensor.shape[0]):
+                    # The L2 norm of the difference vector is the most direct measure of change.
+                    delta_norm = torch.norm(diff_tensor[expert_idx]).item()
+                    print(f"    - Expert {expert_idx} Delta (L2 Norm of Weight Change): {delta_norm:.6f}")
+                print("\n") # Add a newline for readability before the next client starts
             # --- TTA STATISTICS COLLECTION (UNCHANGED) ---
             # This runs based on the tta_blend_target argument
             collect_stats(model_dict[domain_name], dataloader_dict[domain_name]['train'], 
@@ -458,8 +506,10 @@ def main():
         
         if include_private_in_agg:
             log_file.info(f"[INFO] TTA Strategy '{args.tta_blend_target}': Aggregating BOTH private and public trunks.")
+            print(f"[INFO] TTA Strategy '{args.tta_blend_target}': Aggregating BOTH private and public trunks.")
         else:
             log_file.info(f"[INFO] TTA Strategy '{args.tta_blend_target}': Aggregating PUBLIC trunk ONLY.")
+            print(f"[INFO] TTA Strategy '{args.tta_blend_target}': Aggregating PUBLIC trunk ONLY.")
         
         # The rest of the code is now correct and does not need to be changed.
         client_params_to_agg = [model_dict[name].get_trainable_params(include_private=include_private_in_agg) for name in dataobj.train_domain_list]
@@ -492,7 +542,7 @@ def main():
             print(f"  Selected '{anchor_client_name}' as anchor for this round (Accuracy: {client_accuracies[anchor_client_idx]*100:.2f}%)")
 
             # 2. Prepare inputs for ExpertMatchedAvg
-            client_reps = [extract_expert_weights_as_vectors(model_dict[name], include_private=False) for name in dataobj.train_domain_list]
+            client_reps = [generate_expert_representations(model_dict[name], include_private=False) for name in dataobj.train_domain_list]
             reference_reps = client_reps[anchor_client_idx] # The anchor's reps are the reference
             
             # 3. Call the refactored function
@@ -501,10 +551,11 @@ def main():
         elif args.agg_strategy == 'elma':
             # --- ELMA Strategy ---
             log_file.info("Performing Expert-Level Matched Aggregation (ELMA)...")
+            print("Performing Expert-Level Matched Aggregation (ELMA)...")
             
             # --- MODIFIED LINES: Only get PUBLIC representations ---
-            global_reps = extract_expert_weights_as_vectors(global_model, include_private=False)
-            client_reps = [extract_expert_weights_as_vectors(model_dict[name], include_private=False) for name in dataobj.train_domain_list]
+            global_reps = generate_expert_representations(global_model, include_private=False)
+            client_reps = [generate_expert_representations(model_dict[name], include_private=False) for name in dataobj.train_domain_list]
             # --- END OF MODIFIED LINES ---
 
             # Now, ELMA will only operate on the public trunk experts.
@@ -526,6 +577,7 @@ def main():
         else:
             # --- Standard FedAvg ---
             log_file.info("Performing standard FedAvg...")
+            print("Performing standard FedAvg...")
             global_avg_shared_params = FedAvg(client_params_to_agg, client_weights)
 
         # ---> SERVER-SIDE AGGREGATION OF MIGS STATISTICS <---

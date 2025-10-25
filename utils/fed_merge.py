@@ -17,7 +17,8 @@ def permute_state_dict(state_dict, permutation_map, model_prefix=""):
 
     for module_name, p in permutation_map.items():
         # module_name is the exact prefix, e.g., '0.blocks.4.attn.qkv'
-        full_layer_prefix = module_name
+        # full_layer_prefix = module_name
+        full_layer_prefix = module_name.removesuffix('.router')
         print(f"[DEBUG PERMUTE] Processing layer. Searching for parameters with prefix: '{full_layer_prefix}'")
 
         expert_param_keys = [k for k in state_dict.keys() if k.startswith(full_layer_prefix) and 'proj_adapter' in k]
@@ -55,6 +56,17 @@ def permute_state_dict(state_dict, permutation_map, model_prefix=""):
         
         permuted_dict.update(temp_layer_params)
 
+# --- NEW: Calculate total number of individual weights being permuted ---
+    total_individual_weights = 0
+    if total_params_in_scope > 0:
+        # Get the keys of the parameters that were in scope for permutation
+        all_expert_keys = []
+        for module_name in permutation_map.keys():
+            keys_in_layer = [k for k in state_dict.keys() if k.startswith(module_name) and 'proj_adapter' in k]
+            all_expert_keys.extend(keys_in_layer)
+        # Sum up the number of elements in each of these tensors
+        total_individual_weights = sum(state_dict[k].numel() for k in all_expert_keys)
+
     # Final summary log
     print(f"--- Finished permutation ---")
     if total_params_in_scope > 0:
@@ -62,11 +74,13 @@ def permute_state_dict(state_dict, permutation_map, model_prefix=""):
             print(f"[INFO ELMA - PERMUTATION] Successfully remapped {num_params_swapped} / {total_params_in_scope} expert parameters.")
         else:
             print(f"[INFO ELMA - PERMUTATION] All experts were already aligned. No parameters remapped.")
+        print(f"[INFO ELMA - SCOPE] The permutation scope covered {total_params_in_scope} tensors, comprising a total of {total_individual_weights:,} individual weights.")
     elif len(permutation_map) > 0:
         print(f"[ERROR ELMA - PERMUTATION] Found 0 total expert parameters across all layers. Check module discovery logic.")
     print("") # Newline for readability
 
     return permuted_dict
+
 
 def ExpertMatchedAvg(client_states, client_weights, reference_reps, client_reps, args):
     """

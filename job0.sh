@@ -61,12 +61,14 @@ for domain in "${domains[@]}"; do
         --batch_size 32 --log_similarities \
         --model clip_moe_style \
         --local_epochs 10 \
-        --comm 10 \
+        --comm 5 \
         --private_blocks_count 4 \
         --do_migs \
         --migs_lambda_mean 10 \
         --migs_lambda_cov 10 \
-        --agg_strategy elma_prob_anchor \
+        --do_expert_div \
+        --expert_div_lambda 1.0 \
+        --agg_strategy elma \
         --note "baseline"
 done
 

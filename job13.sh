@@ -25,7 +25,7 @@ echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
 
 # Move the code to the compute node
 cp -r /scratch/st-msheha02-1/mosama97/FedDG-MoE2 $SLURM_TMPDIR
-# cp -r /scratch/st-msheha02-1/mosama97/datasets/pacs81.zip $SLURM_TMPDIR/FedDG-MoE2/datasets
+cp -r /scratch/st-msheha02-1/mosama97/datasets/pacs81.zip $SLURM_TMPDIR/FedDG-MoE2/datasets
 
 echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
 
@@ -43,32 +43,32 @@ export WANDB_MODE=offline
 # Force Hugging Face and Timm to work offline and not attempt any network connection
 export TRANSFORMERS_OFFLINE=1
 cd $SLURM_TMPDIR/FedDG-MoE2/datasets
-# mv pacs81.zip pacs.zip
-unzip OfficeHome.zip
+mv pacs81.zip pacs.zip
+unzip pacs.zip
 cd $SLURM_TMPDIR/FedDG-MoE2/
 echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
 domains=(
   "p"
   "a"
   "c"
-  "r"
+  "s"
 )
 
 for domain in "${domains[@]}"; do
     # Run your program
-    python3 algorithms/feddg_moe/train_officehome.py \
+    python3 algorithms/feddg_moe/train_pacs.py \
         --test_domain $domain \
         --batch_size 32 --log_similarities \
         --model clip_moe_style \
         --local_epochs 10 \
-        --comm 5 \
+        --comm 10 \
         --private_blocks_count 4 \
         --do_migs \
         --migs_lambda_mean 10 \
         --migs_lambda_cov 10 \
-        --agg_strategy elma_prob_anchor \
+        --agg_strategy elma \
         --do_expert_div \
-        --expert_div_lambda 5.0 \
+        --expert_div_lambda 1.0 \  
         --note "baseline"
 done
 
