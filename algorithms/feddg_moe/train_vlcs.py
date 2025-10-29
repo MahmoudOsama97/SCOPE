@@ -500,13 +500,13 @@ def main():
     best_val = 0.
     for i in range(args.comm + 1):
         # 1. Distribution: Send global shared params to all clients
-        if i > 0: # No distribution on the first round
-            strategies_that_do_not_aggregate_private_trunk = ['global_private', 'layer_wise']
-            include_private_in_dist = (args.tta_blend_target not in strategies_that_do_not_aggregate_private_trunk)
-            global_params_to_dist = global_model.get_trainable_params(include_private=include_private_in_dist)
+        # if i > 0: # No distribution on the first round
+        #     strategies_that_do_not_aggregate_private_trunk = ['global_private', 'layer_wise']
+        #     include_private_in_dist = (args.tta_blend_target not in strategies_that_do_not_aggregate_private_trunk)
+        #     global_params_to_dist = global_model.get_trainable_params(include_private=include_private_in_dist)
             
-            for domain_name in dataobj.train_domain_list:
-                model_dict[domain_name].load_params(global_params_to_dist)
+        #     for domain_name in dataobj.train_domain_list:
+        #         model_dict[domain_name].load_params(global_params_to_dist)
 
         # 2. Local Training and NEW Local Prototype Computation
         local_prototypes_list = []
@@ -585,7 +585,14 @@ def main():
         
         # The rest of the code is now correct and does not need to be changed.
         client_params_to_agg = [model_dict[name].get_trainable_params(include_private=include_private_in_agg) for name in dataobj.train_domain_list]
-        
+        # +++ START OF DEBUG LOG +++
+        num_params_to_agg = len(client_params_to_agg[0])
+        if num_params_to_agg > 0:
+            first_param_key = list(client_params_to_agg[0].keys())[0]
+            log_file.info(f"[DEBUG SPLIT] Round {i}: Successfully extracted {num_params_to_agg} public parameter tensors for aggregation. First key: '{first_param_key}'")
+        else:
+            log_file.warning(f"[CRITICAL WARNING SPLIT] Round {i}: Extracted 0 public parameters for aggregation. The global model will not update. Check 'get_trainable_params' and model naming.")
+        # +++ END OF DEBUG LOG +++     
         client_weights = [weight_dict[name] for name in dataobj.train_domain_list]
 
         if args.agg_strategy == 'elma_prob_anchor':
@@ -618,8 +625,37 @@ def main():
             reference_reps = client_reps[anchor_client_idx] # The anchor's reps are the reference
             
             # 3. Call the refactored function
-            global_avg_shared_params, permutation_maps = ExpertMatchedAvg(client_params_to_agg, client_weights, reference_reps, client_reps, args)
+            global_avg_experts, global_avg_general_params, personalized_routers, permutation_maps = ExpertMatchedAvg(
+                client_params_to_agg, client_weights, global_reps, client_reps, args
+            )
             last_round_permutation_maps = permutation_maps #<-- ADD THIS LINE
+                        # +++ START OF DEBUG LOG +++
+            # Check the permutation for the first client and a sample layer to see if it's working
+            first_client_perms_dict = permutation_maps[0]
+            if first_client_perms_dict:
+                sample_layer = list(first_client_perms_dict.keys())[0]
+                perm_map = first_client_perms_dict[sample_layer]
+                perm_string = str(perm_map)
+                log_file.info(f"[DEBUG ELMA] Round {i}, Client 0, Sample Permutation: {perm_string}")
+                # Check for the silent failure condition
+                identity_perm = list(range(len(perm_map)))
+                if list(perm_map) == identity_perm:
+                    log_file.warning(f"[WARNING ELMA] Round {i}: Permutation for client 0 is the identity. ELMA may not be effective (experts may be too similar).")
+            # +++ END OF DEBUG LOG +++
+            # --- ELMA Distribution ---
+            # a) Load the common parts into the global model template
+            global_model.load_params(global_avg_experts)
+            global_model.load_params(global_avg_general_params)
+            # b) Loop to create and distribute a personalized package for each client
+            for domain_name in dataobj.train_domain_list:
+                # Temporarily load this client's personalized router to create the full package
+                global_model.load_params(personalized_routers[domain_name])
+                
+                # Extract the complete, personalized shared trunk
+                personalized_shared_trunk = global_model.get_trainable_params(include_private=False)
+                
+                # Distribute the personalized trunk
+                model_dict[domain_name].load_params(personalized_shared_trunk)
         elif args.agg_strategy == 'elma':
             # --- ELMA Strategy ---
             log_file.info("Performing Expert-Level Matched Aggregation (ELMA)...")
@@ -630,10 +666,38 @@ def main():
             client_reps = [generate_expert_representations(model_dict[name], include_private=False) for name in dataobj.train_domain_list]
             # --- END OF MODIFIED LINES ---
 
-            # Now, ELMA will only operate on the public trunk experts.
-            global_avg_shared_params, permutation_maps = ExpertMatchedAvg(client_params_to_agg, client_weights, global_reps, client_reps, args)
+            # 3. Call the refactored function
+            global_avg_experts, global_avg_general_params, personalized_routers, permutation_maps = ExpertMatchedAvg(
+                client_params_to_agg, client_weights, global_reps, client_reps, args
+            )
             last_round_permutation_maps = permutation_maps #<-- ADD THIS LINE
+                        # +++ START OF DEBUG LOG +++
             # Check the permutation for the first client and a sample layer to see if it's working
+            first_client_perms_dict = permutation_maps[0]
+            if first_client_perms_dict:
+                sample_layer = list(first_client_perms_dict.keys())[0]
+                perm_map = first_client_perms_dict[sample_layer]
+                perm_string = str(perm_map)
+                log_file.info(f"[DEBUG ELMA] Round {i}, Client 0, Sample Permutation: {perm_string}")
+                # Check for the silent failure condition
+                identity_perm = list(range(len(perm_map)))
+                if list(perm_map) == identity_perm:
+                    log_file.warning(f"[WARNING ELMA] Round {i}: Permutation for client 0 is the identity. ELMA may not be effective (experts may be too similar).")
+            # +++ END OF DEBUG LOG +++
+            # --- ELMA Distribution ---
+            # a) Load the common parts into the global model template
+            global_model.load_params(global_avg_experts)
+            global_model.load_params(global_avg_general_params)
+            # b) Loop to create and distribute a personalized package for each client
+            for domain_name in dataobj.train_domain_list:
+                # Temporarily load this client's personalized router to create the full package
+                global_model.load_params(personalized_routers[domain_name])
+                
+                # Extract the complete, personalized shared trunk
+                personalized_shared_trunk = global_model.get_trainable_params(include_private=False)
+                
+                # Distribute the personalized trunk
+                model_dict[domain_name].load_params(personalized_shared_trunk)
             first_client_perms = permutation_maps[0]
             sample_layer = list(first_client_perms.keys())[0] if first_client_perms else None
             if sample_layer:
@@ -653,6 +717,16 @@ def main():
             print("Performing standard FedAvg...")
             global_avg_shared_params = FedAvg(client_params_to_agg, client_weights)
             last_round_permutation_maps = None #<-- ADD THIS LINE
+            # --- FedAvg Distribution ---
+            # a) Load the aggregated trunk into the global model
+            global_model.load_params(global_avg_shared_params)
+            
+            # b) Distribute the same shared trunk to all clients
+            strategies_that_do_not_aggregate_private_trunk = ['global_private', 'layer_wise']
+            include_private_in_dist = (args.tta_blend_target not in strategies_that_do_not_aggregate_private_trunk)
+            params_to_dist = global_model.get_trainable_params(include_private=include_private_in_dist)
+            for domain_name in dataobj.train_domain_list:
+                model_dict[domain_name].load_params(params_to_dist)
         # ---> SERVER-SIDE AGGREGATION OF MIGS STATISTICS <---
         if args.do_migs and all_clients_migs_stats:
             print("Aggregating local statistics into global MIGS targets...")
@@ -675,7 +749,7 @@ def main():
             global_stats_for_migs = aggregated_stats
 
 
-        global_model.load_params(global_avg_shared_params)
+        # global_model.load_params(global_avg_shared_params)
         if args.do_fci and local_prototypes_list:
             print("Aggregating local prototypes into global prototypes...")
             # Stack all local prototype tensors and average them
@@ -696,6 +770,9 @@ def main():
         permuted_model_dict_for_this_round = {}
         print(f"last_round_permutation_maps: {last_round_permutation_maps}")
         if args.agg_strategy in ['elma', 'elma_prob_anchor'] and last_round_permutation_maps is not None:
+            # +++ START OF DEBUG LOG +++
+            log_file.info(f"[DEBUG L-TTA] Round {i}: Creating pre-permuted models for TTA evaluation.")
+            # +++ END OF DEBUG LOG +++
             # Create a fresh set of aligned models for this round's evaluation
             for client_idx, domain_name in enumerate(dataobj.train_domain_list):
                 original_model_state = model_dict[domain_name].state_dict()
@@ -709,6 +786,9 @@ def main():
                 aligned_model.load_state_dict(permuted_state)
                 permuted_model_dict_for_this_round[domain_name] = aligned_model.cuda()
         else:
+            # +++ START OF DEBUG LOG +++
+            log_file.info(f"[DEBUG L-TTA] Round {i}: Using original (un-permuted) models for TTA evaluation (Strategy: {args.agg_strategy}).")
+            # +++ END OF DEBUG LOG +++
             # If not using ELMA, the TTA source is just the original models
             permuted_model_dict_for_this_round = model_dict
         

@@ -45,42 +45,57 @@ def permute_state_dict(state_dict, permutation_map, model_prefix=""):
 
 def ExpertMatchedAvg(client_states, client_weights, reference_reps, client_reps, args):
     """
-    Performs Expert-Level Matched Aggregation (ELMA) by aligning each client
-    to a common set of reference expert representations.
+    Performs ELMA, returning averaged experts, averaged general params,
+    and personalized routers separately. (MODIFIED)
     """
-    permuted_client_states = []
     all_permutation_maps = []
-    
+    all_clients_permuted_experts = []
+    all_clients_general_params = []
+    personalized_routers = {}
+
+    # --- 1. Find Permutation Maps and Separate Client Parameters ---
     for client_idx, client_state in enumerate(client_states):
+        # ... (The permutation map calculation logic remains exactly the same) ...
         client_rep_to_match = client_reps[client_idx]
-        print(f"[INFO ELMA] Processing Client client_rep_to_match {client_idx} for ELMA.")
-        print(f"[DEBUG ELMA] Client {client_idx} layers available for matching: {list(client_rep_to_match.keys())}")
         permutation_map = {}
-        
         for layer_name, ref_expert_reps in reference_reps.items():
-            if layer_name not in client_rep_to_match:
-                print(f"[WARNING ELMA] Layer '{layer_name}' not found in client {client_idx} representations. Skipping.")
-                continue
-            
+            if layer_name not in client_rep_to_match: continue
             client_expert_reps = client_rep_to_match[layer_name]
-            
             num_experts = ref_expert_reps.shape[0]
             cost_matrix = torch.zeros((num_experts, num_experts))
             for i in range(num_experts):
                 for j in range(num_experts):
                     cost_matrix[i, j] = 1 - cosine_similarity(ref_expert_reps[i].unsqueeze(0), client_expert_reps[j].unsqueeze(0))
-            print(f"[DEBUG ELMA] Cost matrix for layer '{layer_name}' (Client {client_idx}):\n{cost_matrix.numpy()}")
-
             row_ind, col_ind = linear_sum_assignment(cost_matrix.numpy())
-            print(f"[DEBUG ELMA] Optimal assignment for layer '{layer_name}' (Client {client_idx}): {list(zip(row_ind, col_ind))}")
             permutation_map[layer_name] = col_ind
-
         all_permutation_maps.append(permutation_map)
-        
+
+        # --- 2. Permute and Categorize Parameters ---
         permuted_state = permute_state_dict(client_state, permutation_map)
-        permuted_client_states.append(permuted_state)
         
-    return FedAvg(permuted_client_states, client_weights), all_permutation_maps
+        experts_only_state = OrderedDict()
+        router_only_state = OrderedDict()
+        general_params_state = OrderedDict()
+
+        for key, value in permuted_state.items():
+            if 'proj_adapter' in key:
+                experts_only_state[key] = value
+            elif 'router.sim_matrix' in key:
+                router_only_state[key] = value
+            else: # This includes classification head AND router.cosine_projector
+                general_params_state[key] = value
+
+        all_clients_permuted_experts.append(experts_only_state)
+        all_clients_general_params.append(general_params_state)
+        # Personalized routers are stored by domain name for later distribution
+        client_name = args.site_list[client_idx]
+        personalized_routers[client_name] = router_only_state
+
+    # --- 3. Aggregate the appropriate categories ---
+    global_avg_experts = FedAvg(all_clients_permuted_experts, client_weights)
+    global_avg_general_params = FedAvg(all_clients_general_params, client_weights)
+
+    return global_avg_experts, global_avg_general_params, personalized_routers, all_permutation_maps
 
 
 
