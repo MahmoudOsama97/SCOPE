@@ -24,6 +24,64 @@ from utils.domain_stats.offline.offline_gmm import OfflineGMMTracker
 from utils.domain_stats.offline.offline_mahalanobis import OfflineMahalanobisTracker
 from utils.domain_stats.offline.offline_cosine import OfflineCosineTracker, OfflineCosineMuVarTracker, OfflineCosineConcat
 from utils.lora_util import CosineTopKGate
+# +++ START OF NEW, MODIFIED SERVER-SIDE DEBUG FUNCTION +++
+def debug_server_side_routers(client_states, client_names, private_blocks_count):
+    """
+    Prints the raw `sim_matrix` from the router of each client for direct comparison.
+
+    This helps to visually inspect if the learned expert embeddings are diverging.
+    """
+    if not client_states or len(client_states) < 2:
+        print("\n--- DEBUG: Cannot compare server-side routers (need at least 2 clients) ---\n")
+        return
+
+    print(f"\n--- DEBUG: Server-Side Router `sim_matrix` Raw Weight Comparison ---")
+    
+    # --- Find all public router sim_matrix keys from the first client ---
+    ref_state = client_states[0]
+    public_router_keys = []
+    for key in ref_state.keys():
+        if ".router.sim_matrix" in key:
+            try:
+                block_num = int(re.search(r'blocks\.(\d+)', key).group(1))
+                if block_num >= private_blocks_count:
+                    public_router_keys.append(key)
+            except (AttributeError, IndexError, ValueError):
+                print(f"[WARNING] Could not determine block number for router key: {key}. Skipping.")
+                continue
+    
+    if not public_router_keys:
+        print("\n[WARNING] Could not find any public router `sim_matrix` parameters to compare!\n")
+        return
+
+    # --- To avoid spamming the log, let's inspect only the FIRST public router ---
+    key_to_inspect = public_router_keys[0]
+    print(f"\n--- Inspecting Router Matrix: {key_to_inspect} ---")
+    
+    # --- 1. Print the raw sim_matrix tensor for each client ---
+    for i, name in enumerate(client_names):
+        print(f"  Client '{name}':")
+        tensor = client_states[i][key_to_inspect]
+        # Print the tensor. We can use options to format it nicely.
+        torch.set_printoptions(precision=4, sci_mode=False)
+        print(tensor)
+        print("-" * 20) # Separator
+
+    # --- 2. For a quantitative comparison, also print the L2 distance ---
+    print(f"  Pairwise L2 Distance (Delta) from reference client '{client_names[0]}':")
+    ref_tensor = client_states[0][key_to_inspect]
+    for i in range(1, len(client_names)):
+        name = client_names[i]
+        comp_tensor = client_states[i][key_to_inspect]
+        delta_norm = torch.norm(ref_tensor - comp_tensor).item()
+        print(f"    - Delta vs {name:<8}: {delta_norm:.6f}")
+    
+    print("\n--- End of Server-Side Router Comparison ---\n")
+    # Reset print options to default to not affect other parts of the code
+    torch.set_printoptions(profile="default") 
+
+
+
 
 # +++ START OF NEW DEBUG FUNCTION +++
 def debug_expert_representations(model, site_name, stage=""):
@@ -416,7 +474,7 @@ def main():
     # --- NEW: Conditional Tracker Setup ---
     first_client_model = model_dict[dataobj.train_domain_list[0]]
     shared_adapter_indices = first_client_model.shared_adapter_indices
-    
+    last_round_permutation_maps = None # <-- ADD THIS: Variable to store final maps        
     domain_stats_private = create_tracker(args)
     domain_stats_shared = None # This will hold either a single tracker or a dict
     # Initialize global stats for MIGS
@@ -438,7 +496,7 @@ def main():
     # NEW: Initialize global prototypes
     global_prototypes = None
     feature_dim = global_model.model[0].num_features
-    FedUpdate(model_dict, global_model)
+    # FedUpdate(model_dict, global_model)
     best_val = 0.
     for i in range(args.comm + 1):
         # 1. Distribution: Send global shared params to all clients
@@ -456,27 +514,41 @@ def main():
         all_clients_migs_stats = []
         # +++ END MIGS MODIFICATION +++
         # +++ NEW: List to store client validation accuracies +++
-        client_accuracies = []    
+        client_accuracies = []  
+        strategies_that_do_not_aggregate_private_trunk = ['global_private', 'layer_wise']
+        include_private_in_agg = (args.tta_blend_target not in strategies_that_do_not_aggregate_private_trunk)
+        client_params_to_agg = [model_dict[name].get_trainable_params(include_private=include_private_in_agg) for name in dataobj.train_domain_list]
+  
         for domain_id, domain_name in enumerate(dataobj.train_domain_list):
 
-            reps_before = debug_expert_representations(model_dict[domain_name], domain_name, stage="Before Local Training")     
-
+            # reps_before = debug_expert_representations(model_dict[domain_name], domain_name, stage="Before Local Training")     
+            client_params_to_agg = [model_dict[name].get_trainable_params(include_private=include_private_in_agg) for name in dataobj.train_domain_list]
+            debug_server_side_routers(
+                client_params_to_agg,
+                dataobj.train_domain_list,
+                args.private_blocks_count
+            )
             feddgmoe_site_train(i, domain_name, args, model_dict[domain_name], optimizer_dict[domain_name], 
                       scheduler_dict[domain_name], dataloader_dict[domain_name]['train'], log_ten, metric, domain_id, global_prototypes=global_prototypes, global_stats=global_stats_for_migs if args.do_migs else None)
-            
-            reps_after = debug_expert_representations(model_dict[domain_name], domain_name, stage="After Local Training")
+            client_params_to_agg = [model_dict[name].get_trainable_params(include_private=include_private_in_agg) for name in dataobj.train_domain_list]
+            debug_server_side_routers(
+                client_params_to_agg,
+                dataobj.train_domain_list,
+                args.private_blocks_count
+            )            
+            # reps_after = debug_expert_representations(model_dict[domain_name], domain_name, stage="After Local Training")
             # 3. Calculate and print the DELTA (the change in weights)
-            print(f"\n--- DEBUG: Expert Weight Change for site '{domain_name}' (Round {i}) ---")
-            for layer_name in reps_before.keys():
-                # Calculate the difference vector for each expert
-                diff_tensor = reps_after[layer_name] - reps_before[layer_name]
+            # print(f"\n--- DEBUG: Expert Weight Change for site '{domain_name}' (Round {i}) ---")
+            # for layer_name in reps_before.keys():
+            #     # Calculate the difference vector for each expert
+            #     diff_tensor = reps_after[layer_name] - reps_before[layer_name]
                 
-                print(f"  Layer '{layer_name}':")
-                for expert_idx in range(diff_tensor.shape[0]):
-                    # The L2 norm of the difference vector is the most direct measure of change.
-                    delta_norm = torch.norm(diff_tensor[expert_idx]).item()
-                    print(f"    - Expert {expert_idx} Delta (L2 Norm of Weight Change): {delta_norm:.6f}")
-                print("\n") # Add a newline for readability before the next client starts
+            #     print(f"  Layer '{layer_name}':")
+            #     for expert_idx in range(diff_tensor.shape[0]):
+            #         # The L2 norm of the difference vector is the most direct measure of change.
+            #         delta_norm = torch.norm(diff_tensor[expert_idx]).item()
+            #         print(f"    - Expert {expert_idx} Delta (L2 Norm of Weight Change): {delta_norm:.6f}")
+            #     print("\n") # Add a newline for readability before the next client starts
             # --- TTA STATISTICS COLLECTION (UNCHANGED) ---
             # This runs based on the tta_blend_target argument
             collect_stats(model_dict[domain_name], dataloader_dict[domain_name]['train'], 
@@ -547,7 +619,7 @@ def main():
             
             # 3. Call the refactored function
             global_avg_shared_params, permutation_maps = ExpertMatchedAvg(client_params_to_agg, client_weights, reference_reps, client_reps, args)
-
+            last_round_permutation_maps = permutation_maps #<-- ADD THIS LINE
         elif args.agg_strategy == 'elma':
             # --- ELMA Strategy ---
             log_file.info("Performing Expert-Level Matched Aggregation (ELMA)...")
@@ -560,6 +632,7 @@ def main():
 
             # Now, ELMA will only operate on the public trunk experts.
             global_avg_shared_params, permutation_maps = ExpertMatchedAvg(client_params_to_agg, client_weights, global_reps, client_reps, args)
+            last_round_permutation_maps = permutation_maps #<-- ADD THIS LINE
             # Check the permutation for the first client and a sample layer to see if it's working
             first_client_perms = permutation_maps[0]
             sample_layer = list(first_client_perms.keys())[0] if first_client_perms else None
@@ -579,7 +652,7 @@ def main():
             log_file.info("Performing standard FedAvg...")
             print("Performing standard FedAvg...")
             global_avg_shared_params = FedAvg(client_params_to_agg, client_weights)
-
+            last_round_permutation_maps = None #<-- ADD THIS LINE
         # ---> SERVER-SIDE AGGREGATION OF MIGS STATISTICS <---
         if args.do_migs and all_clients_migs_stats:
             print("Aggregating local statistics into global MIGS targets...")
@@ -618,10 +691,34 @@ def main():
             log_file.info(f'Global model saved! Best Val Acc: {best_val*100:.2f}%')
             print(f'Global model saved! Best Val Acc: {best_val*100:.2f}%')
 
-        # 5. Test using the new hybrid evaluation function
+        # +++ START OF MODIFIED EVALUATION BLOCK +++
+        # --- 5. Create a temporary, permuted model dictionary for this round's TTA ---
+        permuted_model_dict_for_this_round = {}
+        print(f"last_round_permutation_maps: {last_round_permutation_maps}")
+        if args.agg_strategy in ['elma', 'elma_prob_anchor'] and last_round_permutation_maps is not None:
+            # Create a fresh set of aligned models for this round's evaluation
+            for client_idx, domain_name in enumerate(dataobj.train_domain_list):
+                original_model_state = model_dict[domain_name].state_dict()
+                client_permutation_map = last_round_permutation_maps[client_idx]
+                
+                # Permute the state dict to align it to the global reference
+                permuted_state = permute_state_dict(original_model_state, client_permutation_map)
+                
+                # Load this aligned state into a new model instance to avoid altering the original
+                aligned_model, _ = GetNetwork(args, args.num_classes)
+                aligned_model.load_state_dict(permuted_state)
+                permuted_model_dict_for_this_round[domain_name] = aligned_model.cuda()
+        else:
+            # If not using ELMA, the TTA source is just the original models
+            permuted_model_dict_for_this_round = model_dict
+        
+        # --- 6. Test using the correctly aligned models for this round ---
         FedTune_testsite_eval(i, args.test_domain, args, global_model, dataloader_dict[args.test_domain]['test'], 
-                         log_file, log_ten, metric, note='test_domain', model_dict=model_dict, domain_stats_private=domain_stats_private, domain_stats_shared=domain_stats_shared,
+                         log_file, log_ten, metric, note='test_domain', 
+                         model_dict=permuted_model_dict_for_this_round, #<-- USE THE PERMUTED DICT
+                         domain_stats_private=domain_stats_private, domain_stats_shared=domain_stats_shared,
                          weight_dict=weight_dict)
+        # +++ END OF MODIFIED EVALUATION BLOCK +++
         
     SaveCheckPoint(args, global_model, args.comm, os.path.join(log_dir, 'checkpoints'), note='last_model')
     for domain_name in dataobj.train_domain_list: 

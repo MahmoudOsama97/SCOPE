@@ -135,13 +135,13 @@ class K_Linear_MoE_new_(nn.Linear, LoRALayer):
             for i in range(self.n):
                 self.proj_adapter1_left.append(
                     nn.Parameter(
-                        torch.Tensor(size=(phm_dim, self._in_feats_per_axis, self.phm_rank * (2**i))),
+                        torch.Tensor(size=(phm_dim, self._in_feats_per_axis, self.phm_rank * 8)),
                         requires_grad=True,
                     )
                 )
                 self.proj_adapter1_right.append(
                     nn.Parameter(
-                        torch.Tensor(size=(phm_dim, self.phm_rank * (2**i), self._out_feats_per_axis)),
+                        torch.Tensor(size=(phm_dim, self.phm_rank * 8, self._out_feats_per_axis)),
                         requires_grad=True,
                     )
                 )

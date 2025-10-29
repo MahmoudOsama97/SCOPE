@@ -24,8 +24,8 @@ fi
 echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
 
 # Move the code to the compute node
-cp -r /scratch/st-msheha02-1/mosama97/FedDG-MoE2 $SLURM_TMPDIR
-cp -r /scratch/st-msheha02-1/mosama97/datasets/pacs81.zip $SLURM_TMPDIR/FedDG-MoE2/datasets
+cp -r /scratch/st-msheha02-1/mosama97/SCOPE1 $SLURM_TMPDIR
+cp -r /scratch/st-msheha02-1/mosama97/datasets/pacs81.zip $SLURM_TMPDIR/SCOPE1/datasets
 
 echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
 
@@ -42,10 +42,10 @@ export WANDB_MODE=offline
 # 4. !!! ADD THIS LINE - The most important change !!!
 # Force Hugging Face and Timm to work offline and not attempt any network connection
 export TRANSFORMERS_OFFLINE=1
-cd $SLURM_TMPDIR/FedDG-MoE2/datasets
+cd $SLURM_TMPDIR/SCOPE1/datasets
 mv pacs81.zip pacs.zip
 unzip pacs.zip
-cd $SLURM_TMPDIR/FedDG-MoE2/
+cd $SLURM_TMPDIR/SCOPE1/
 echo "EXPORTED_SLURM_VARS: $SLURM_TMPDIR"
 domains=(
   "p"
@@ -72,7 +72,7 @@ done
 
 python3 analyze_logs.py --output_folder ./exps --note "baseline"
 
-cp -r $SLURM_TMPDIR/FedDG-MoE2/exps/. /scratch/st-msheha02-1/mosama97/output/
+cp -r $SLURM_TMPDIR/SCOPE1/exps/. /scratch/st-msheha02-1/mosama97/output/
 echo "----------------------------------------"
 
 

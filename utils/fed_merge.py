@@ -7,80 +7,41 @@ import torch
 
 def permute_state_dict(state_dict, permutation_map, model_prefix=""):
     """
-    Permutes the expert weights in a state_dict according to a permutation map.
-    (Final, Direct, Non-Parsing Version with Debugging)
+    Permutes the expert weights AND router embeddings in a state_dict 
+    according to a permutation map. (MODIFIED)
     """
-    print(f"\n--- Running permute_state_dict ---")
     permuted_dict = state_dict.copy()
-    num_params_swapped = 0
-    total_params_in_scope = 0
 
-    for module_name, p in permutation_map.items():
-        # module_name is the exact prefix, e.g., '0.blocks.4.attn.qkv'
-        # full_layer_prefix = module_name
-        full_layer_prefix = module_name.removesuffix('.router')
-        print(f"[DEBUG PERMUTE] Processing layer. Searching for parameters with prefix: '{full_layer_prefix}'")
-
-        expert_param_keys = [k for k in state_dict.keys() if k.startswith(full_layer_prefix) and 'proj_adapter' in k]
-        total_params_in_scope += len(expert_param_keys)
-        num_experts = len(p) if 'p' in locals() and p is not None else len(expert_param_keys) // 2
-        print(f"[DEBUG PERMUTE]   - Found {len(expert_param_keys)} param tensors for {num_experts} experts (left/right pairs).")
-        print(f"[DEBUG PERMUTE]   - total_params_in_scope so far: {total_params_in_scope}")
-
-        if not expert_param_keys:
-            print(f"[WARNING PERMUTE] No expert parameters found for layer '{module_name}'. Skipping.")
-            continue
-            
-        temp_layer_params = {}
-        for key in expert_param_keys:
-            # Match the expert index at the VERY END of the string
-            match = re.search(r'\.(\d+)$', key) 
-            if match:
-                i_orig = int(match.group(1))
-                if i_orig < len(p):
-                    i_permuted = p[i_orig]
-                    
-                    if i_orig != i_permuted:
-                        orig_suffix = f".{i_orig}"
-                        permuted_suffix = f".{i_permuted}"
-                        new_key = key[:-len(orig_suffix)] + permuted_suffix
-                        
-                        temp_layer_params[new_key] = state_dict[key]
-                        num_params_swapped += 1
-                        print(f"[DEBUG PERMUTE]   - Remapping '{key}' -> '{new_key}'")
-                    else:
-                        # No change, map key to itself
-                        temp_layer_params[key] = state_dict[key]
-                else:
-                    temp_layer_params[key] = state_dict[key]
+    for layer_name, p in permutation_map.items():
+        # The layer_name from the map is the prefix for the router, e.g., 'model.0.blocks.4.attn.qkv.router'
         
-        permuted_dict.update(temp_layer_params)
+        # --- 1. Permute the Router's sim_matrix ---
+        router_key = f"{layer_name}.sim_matrix"
+        if router_key in state_dict:
+            # sim_matrix shape is [proj_dim, num_experts]. We permute the columns.
+            permuted_dict[router_key] = state_dict[router_key][:, p]
 
-# --- NEW: Calculate total number of individual weights being permuted ---
-    total_individual_weights = 0
-    if total_params_in_scope > 0:
-        # Get the keys of the parameters that were in scope for permutation
-        all_expert_keys = []
-        for module_name in permutation_map.keys():
-            keys_in_layer = [k for k in state_dict.keys() if k.startswith(module_name) and 'proj_adapter' in k]
-            all_expert_keys.extend(keys_in_layer)
-        # Sum up the number of elements in each of these tensors
-        total_individual_weights = sum(state_dict[k].numel() for k in all_expert_keys)
-
-    # Final summary log
-    print(f"--- Finished permutation ---")
-    if total_params_in_scope > 0:
-        if num_params_swapped > 0:
-            print(f"[INFO ELMA - PERMUTATION] Successfully remapped {num_params_swapped} / {total_params_in_scope} expert parameters.")
-        else:
-            print(f"[INFO ELMA - PERMUTATION] All experts were already aligned. No parameters remapped.")
-        print(f"[INFO ELMA - SCOPE] The permutation scope covered {total_params_in_scope} tensors, comprising a total of {total_individual_weights:,} individual weights.")
-    elif len(permutation_map) > 0:
-        print(f"[ERROR ELMA - PERMUTATION] Found 0 total expert parameters across all layers. Check module discovery logic.")
-    print("") # Newline for readability
+        # --- 2. Permute the Expert Weights (left and right adapters) ---
+        # The expert prefix is the layer_name without '.router'
+        expert_prefix = layer_name.rsplit('.', 1)[0]
+        
+        # Find all parameter keys belonging to this layer's experts
+        expert_param_keys = [k for k in state_dict.keys() if k.startswith(expert_prefix) and 'proj_adapter' in k]
+        
+        for key in expert_param_keys:
+            # The original expert index is the number after the last dot
+            base_key, original_expert_index_str = key.rsplit('.', 1)
+            original_expert_index = int(original_expert_index_str)
+            
+            # Find the new index from the permutation map
+            if original_expert_index < len(p):
+                permuted_expert_index = p[original_expert_index]
+                
+                # Create the new key for the permuted parameter
+                new_key = f"{base_key}.{permuted_expert_index}"
+                permuted_dict[new_key] = state_dict[key]
 
     return permuted_dict
-
 
 def ExpertMatchedAvg(client_states, client_weights, reference_reps, client_reps, args):
     """

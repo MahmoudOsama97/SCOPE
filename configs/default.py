@@ -10,9 +10,9 @@ slurm_tmpdir = os.environ.get('SLURM_TMPDIR')
 if slurm_tmpdir is None:
     slurm_tmpdir = '/scratch/st-msheha02-1/mosama97'
 
-log_count_path = slurm_tmpdir + '/FedDG-MoE2/exps/'
-pacs_path = slurm_tmpdir + '/FedDG-MoE2/datasets/pacs'
-terra_incognita_path = slurm_tmpdir + '/FedDG-MoE2/datasets/terra_incognita'
-officehome_path = slurm_tmpdir + '/FedDG-MoE2/datasets/OfficeHome'
-vlcs_path = slurm_tmpdir + '/FedDG-MoE2/datasets/vlcs'
-domain_net_path = slurm_tmpdir + '/FedDG-MoE2/datasets/domain_net'
+log_count_path = slurm_tmpdir + '/SCOPE1/exps/'
+pacs_path = slurm_tmpdir + '/SCOPE1/datasets/pacs'
+terra_incognita_path = slurm_tmpdir + '/SCOPE1/datasets/terra_incognita'
+officehome_path = slurm_tmpdir + '/SCOPE1/datasets/OfficeHome'
+vlcs_path = slurm_tmpdir + '/SCOPE1/datasets/vlcs'
+domain_net_path = slurm_tmpdir + '/SCOPE1/datasets/domain_net'
