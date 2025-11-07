@@ -4,11 +4,10 @@ from utils.lora_util import inject_trainable_moe_kronecker_new
 import timm
 import torch
 from typing import Union, List, Tuple
-from torch.autograd import Function  # <--- ADD THIS LINE
+from torch.autograd import Function
 
 from collections import OrderedDict
 import os
-# +++ START: ADD THIS NEW WRAPPER CLASS +++
 class GradientReversalLayerFn(Function):
     @staticmethod
     def forward(ctx, x, alpha):
@@ -73,14 +72,13 @@ class FedWrapper(nn.Module):
         self.classifier_head = self.model[1]
         
         self.captured_features = {}
-        self.shared_adapter_indices = []  # NEW: Store indices of adapted shared layers
+        self.shared_adapter_indices = []  
 
         # Hook for the private trunk (remains the same)
         if self.private_blocks_count > 0:
             last_private_block = self.featurizer.blocks[self.private_blocks_count - 1]
             last_private_block.register_forward_hook(self._create_hook('private'))
 
-        # NEW: Hook for EACH adaptable shared block
         for i in range(self.private_blocks_count, len(self.featurizer.blocks)):
             block = self.featurizer.blocks[i]
             # A robust check to see if the block has any trainable parameters (i.e., an adapter)
@@ -107,7 +105,6 @@ class FedWrapper(nn.Module):
 
         num_domains = len(self.args.site_list)
         # Create SHARED discriminator (for PUSH logic)
-        # --- NEW: Conditional Setup for Per-Layer or Final-Layer Discriminators ---
         if self.args.do_adv_shared:
             feature_dim = self.featurizer.num_features
             if self.args.per_layer_adv:
@@ -206,7 +203,6 @@ class FedWrapper(nn.Module):
 
         private_features = self.captured_features.get('private', None)
 
-        # NEW: Collect all captured shared features into a dictionary
         shared_features_dict = {}
         for i in self.shared_adapter_indices:
             key = f'shared_block_{i}'
@@ -306,14 +302,10 @@ def my_get_intermediate_layers(
     # forward pass
     B, _, height, width = x.shape
     x = featurizer.patch_embed(x)
-    
-    # +++ START OF MODIFIED/NEW CODE +++
 
     # Add the CLS token before positional embedding
     cls_tokens = featurizer.cls_token.expand(B, -1, -1)
     x = torch.cat((cls_tokens, x), dim=1)
-
-    # +++ END OF MODIFIED/NEW CODE +++
     
     # Apply positional embedding
     if hasattr(featurizer, '_pos_embed'):
@@ -464,7 +456,6 @@ def GetNetwork(args, num_classes, pretrained=True, **kwargs):
         for name, param in featurizer.named_parameters():
             param.requires_grad = False
         # expert_rank = args.expert_rank
-        # inject_trainable_moe_kronecker_new(featurizer, r=[1, 2, 4, 8], where='every_qkv', expert_rank=expert_rank)
         inject_trainable_moe_kronecker_new(featurizer, r=[1, 2, 4, 8], where=args.where)
 
         classifier = nn.Linear(feature_level, num_classes)
@@ -501,7 +492,6 @@ def GetNetwork(args, num_classes, pretrained=True, **kwargs):
         for name, param in featurizer.named_parameters():
             param.requires_grad = False
         # expert_rank = args.expert_rank
-        # inject_trainable_moe_kronecker_new(featurizer, r=[1, 2, 4, 8], where='every_qkv', expert_rank=expert_rank)
         inject_trainable_moe_kronecker_new(featurizer, r=[1, 2, 4, 8], where=args.where)
         classifier = nn.Linear(feature_level, num_classes)
 

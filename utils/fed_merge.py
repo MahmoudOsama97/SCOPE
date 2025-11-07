@@ -1,5 +1,4 @@
 from collections import OrderedDict
-# Add new imports at the top of the file
 from scipy.optimize import linear_sum_assignment
 from torch.nn.functional import cosine_similarity
 import re
@@ -126,7 +125,6 @@ def Cal_Weight_Dict(dataset_dict, site_list=None):
         weight_dict[site_name] = site_len/total_len
     return weight_dict
 
-# +++ START: REPLACE THE OLD FedAvg WITH THIS +++
 def FedAvg(client_states: list, client_weights: list):
     """
     Performs Federated Averaging on a list of state dictionaries.

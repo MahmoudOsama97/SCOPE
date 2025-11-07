@@ -8,14 +8,9 @@ import random
 from network.get_network import feats_extractor
 import copy
 from utils.fed_merge import FedAvg
-from utils.lora_util import K_Linear_MoE_new_ # <-- Make sure to import the MoE class
-
-# --- START OF MODIFIED LINE ---
-# Import the GRL class from where it is defined
+from utils.lora_util import K_Linear_MoE_new_ 
 from network.get_network import GetNetwork, feats_extractor, GradientReversalLayerFn
-# --- END OF MODIFIED LINE ---
 
-# +++ START OF NEW FUNCTION +++
 def ExpertDiversityLoss(model):
     """
     Calculates the intra-client expert diversity loss.
@@ -56,7 +51,6 @@ def ExpertDiversityLoss(model):
     else:
         return 0.0
 
-# +++ START OF NEW CLASS +++
 class MIGSLoss(torch.nn.Module):
     def __init__(self, lambda_mean=1.0, lambda_cov=1.0):
         super().__init__()
@@ -78,7 +72,6 @@ class MIGSLoss(torch.nn.Module):
         loss_cov = self.mse_loss(batch_cov, global_cov)
         
         return (self.lambda_mean * loss_mean) + (self.lambda_cov * loss_cov)
-# +++ END OF NEW CLASS +++
 
 def compute_local_prototypes(model, dataloader, num_classes, feature_dim):
     """
@@ -145,14 +138,12 @@ def site_evaluation(epochs, site_name, args, model, dataloader, log_file, log_te
         for imgs, labels, domain_labels, in dataloader:
             imgs = imgs.cuda()
             
-            # +++ START OF FIX +++
             # Handle conditional tuple output from the model
             model_output = model(imgs)
             if isinstance(model_output, tuple):
                 output = model_output[0]  # For evaluation, we only need the main logits
             else:
                 output = model_output
-            # +++ END OF FIX +++
 
             metric.update(output, labels)
     results_dict = metric.results()
@@ -195,14 +186,11 @@ def feddgmoe_site_train(comm_rounds, site_name, args, model, optimizer, schedule
         tbar.set_description(f'{site_name}_train')
         feddgmoe_epoch_site_train(comm_rounds*args.local_epochs + local_epoch, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id, global_prototypes, global_stats=global_stats)
 
-# Replace the old feddgmoe_epoch_site_train with this new version
 def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, scheduler, dataloader, log_ten, metric, domain_id, global_prototypes=None, global_stats=None):
     model.train()
 
-    # +++ START OF NEW CODE +++
     # Conditionally create the MIGS loss function if needed
     migs_loss_fn = MIGSLoss(args.migs_lambda_mean, args.migs_lambda_cov) if args.do_migs else None
-    # +++ END OF NEW CODE +++    
 
     for i, data_list in enumerate(dataloader):
         imgs, labels, _ = data_list
@@ -213,12 +201,10 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
         # --- Flexible model output and loss calculation ---
         output, p_feats, s_feats_dict = model(imgs)
 
-        # +++ START DEBUG INJECTION: LOSS COMPONENT LOGGING +++
         # At the start of each batch, create a small dictionary to hold loss values for logging
         log_this_batch = (i == 0 and epochs % 1 == 0) # Helper flag for clarity
         if log_this_batch: # Log only for the first batch of every N epochs
              print(f"\n--- Loss Health Check (Epoch {epochs}, Site '{site_name}') ---")
-        # +++ END DEBUG INJECTION +++
 
         # --- 1. Standard Task Loss & Aux Loss (Unchanged) ---
         loss = F.cross_entropy(output, labels)
@@ -230,7 +216,6 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
                         loss_aux += m.aux_loss
             loss += args.aux_loss_weight * loss_aux
 
-     # --- NEW: Intra-Client Expert Diversity Loss ---
         if args.do_expert_div:
             loss_expert_div = ExpertDiversityLoss(model)
             # We add this to the total loss, scaled by its lambda
@@ -313,15 +298,11 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
             if num_layers_processed > 0:
                 if total_fci_loss > 0:
                     avg_fci_loss = total_fci_loss / num_layers_processed
-                    # +++ START DEBUG INJECTION +++
                     if i == 0 and (epochs % 1 == 0): print(f"  [ACTIVE] Per-Layer FCI Loss (Avg): {avg_fci_loss.item():.4f}")
-                    # +++ END DEBUG INJECTION +++
                     loss += args.fci_lambda * avg_fci_loss
                 if total_adv_loss > 0:
                     avg_adv_loss = total_adv_loss / num_layers_processed
-                    # +++ START DEBUG INJECTION +++
                     if i == 0 and (epochs % 1 == 0): print(f"  [ACTIVE] Per-Layer Shared Adv Loss (Avg): {avg_adv_loss.item():.4f}")
-                    # +++ END DEBUG INJECTION +++
                     loss += avg_adv_loss # Lambda is applied inside GRL
 
         # --- 3b. Final-Layer FCI and/or Adversarial Loss (Fallback) ---
@@ -336,9 +317,7 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
                     s_feats_norm = F.normalize(final_s_feats, p=2, dim=1)
                     sim_matrix = torch.mm(s_feats_norm, protos_norm.t())
                     loss_fci = F.cross_entropy(sim_matrix / args.fci_tau, labels)
-                    # +++ START DEBUG INJECTION +++
                     if i == 0 and (epochs % 1 == 0): print(f"  [ACTIVE] Final-Layer FCI Loss: {loss_fci.item():.4f}")
-                    # +++ END DEBUG INJECTION +++
                     loss += args.fci_lambda * loss_fci
                 
                 # Apply Final-Layer Adversarial Loss
@@ -348,9 +327,7 @@ def feddgmoe_epoch_site_train(epochs, site_name, args, model, optimizer, schedul
                     correct_domain_labels = torch.full((batch_size,), fill_value=domain_id, dtype=torch.long, device=final_s_feats.device)
                     domain_pred = model.shared_domain_discriminator(reversed_shared_features)
                     loss_adv_shared = F.cross_entropy(domain_pred, correct_domain_labels)
-                    # +++ START DEBUG INJECTION +++
                     if i == 0 and (epochs % 1 == 0): print(f"  [ACTIVE] Final-Layer Shared Adv Loss: {loss_adv_shared.item():.4f}")
-                    # +++ END DEBUG INJECTION +++                    
                     loss += loss_adv_shared
 
         # --- 4. Other Losses (Ortho, Bottleneck) - Unchanged ---
@@ -404,18 +381,6 @@ def GetFedModel(args, num_classes, is_train=True):
 
         optimizer_dict[domain_name] = torch.optim.SGD(model_dict[domain_name].parameters(), lr=args.lr, momentum=0.9,
                                                       weight_decay=5e-4)
-        # --- START OF FIX: SWITCH TO ADAM OPTIMIZER ---
-        # Adam is often a better choice for adapter-based tuning.
-        # It adapts the learning rate for each parameter individually.
-        # A good default learning rate for Adam is often lower than for SGD.
-        # A weight decay of 0 is common for Adam, but a small value can be used for regularization.
-        # optimizer_dict[domain_name] = torch.optim.Adam(
-        #     model_dict[domain_name].parameters(), 
-        #     lr=args.lr, 
-        #     betas=(0.9, 0.999), 
-        #     weight_decay=5e-4 
-        # )
-        # --- END OF FIX ---
 
         total_epochs = args.local_epochs * args.comm
         if args.lr_policy == 'step':
@@ -438,7 +403,6 @@ def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log
     """
     Test-time evaluation with four strategies: 'public', 'both', 'global_private', and 'disentangled'.
     """
-    # +++ START OF NEW IMPLEMENTATION +++
     # This is the "off switch" for TTA.
     if args.tta_blend_target == 'none':
         log_file.info(f"[INFO TTA] Test-Time Adaptation is DISABLED. Running standard evaluation on the global model.")
@@ -456,11 +420,8 @@ def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log
             metric=metric, 
             note=note
         )
-    # +++ END OF NEW IMPLEMENTATION +++
     global_model.eval()
-    # +++ DEBUG PRINT AT THE START +++
     print(f"\n[INFO TTA] Running Test-Time Adaptation with strategy: '{args.tta_blend_target.upper()}'")
-    # +++ END DEBUG +++
     # --- Pre-compute the "neutral average" private trunk state if needed ---
     avg_private_state = None
     if args.tta_blend_target == 'public':
@@ -515,7 +476,6 @@ def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log
                 out, _, _ = hybrid_model(imgs)
                 metric.update(out, labels)
 
-    # --- LOGIC FOR ORIGINAL TTA STRATEGIES (with compatibility fix) ---
     else:
         with torch.no_grad():
             for imgs, labels, domain_labels, in tqdm(dataloader):
@@ -557,10 +517,8 @@ def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log
                         test_s_feats = test_s_feats_dict[last_layer_idx]
                     similarities = domain_stats_shared.get_domain_weights(test_s_feats)
                     batch_similarities = F.softmax(torch.mean(similarities, dim=0) * args.inv_temp, dim=0)
-                    # +++ DEBUG PRINT +++
                     if args.log_similarities:
                         print(f"  [DEBUG TTA] Standard Weights: {[f'{w:.2f}' for w in batch_similarities]}")
-                    # +++ END DEBUG +++
 
                 # --- 2. Execute Blending Strategy ---
                 if args.tta_blend_target == 'disentangled':
@@ -612,8 +570,6 @@ def FedTune_testsite_eval(epochs, site_name, args, global_model, dataloader, log
 
     return results_dict
 
-# +++ END OF NEW FUNCTION +++
-
 def SaveCheckPoint(args, model, epochs, path, optimizer=None, schedule=None, note='best_val'):
     check_dict = {'args':args, 'epochs':epochs, 'model':model.state_dict(), 'note': note}
     if optimizer is not None:
@@ -649,10 +605,8 @@ def feddgmoe_testsite_eval(epochs, site_name, args, model, dataloader, log_file,
             imgs = imgs.cuda()
 
 
-            # --- MODIFIED LINE ---
             # Call feats_extractor on the full global_model, not a piece of it.
             intermediate_features = feats_extractor(imgs, global_model, avg_tokens=args.avg_tokens, num_layers=args.num_layers)
-            # --- END OF MODIFIED LINE ---
 
             # Calculate domain similarities based on the aggregation type (raw scores - no softmax yet)
             if args.batch_agg_type == "pre_similarity":
@@ -702,10 +656,6 @@ def feddgmoe_testsite_eval(epochs, site_name, args, model, dataloader, log_file,
     
     return results_dict
 
-
-
-
-# +++ START OF NEW FUNCTION +++
 def print_trainable_parameters(model, log_file=None):
     """
     Calculates and prints the number of total and trainable parameters in a model.
@@ -743,4 +693,3 @@ def print_trainable_parameters(model, log_file=None):
         log_file.info(line2)
         log_file.info(line3)
         log_file.info(footer)
-# +++ END OF NEW FUNCTION +++
