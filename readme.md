@@ -1,18 +1,22 @@
-# FedDG-MoE: Test-Time Mixture-of-Experts Fusion for Federated Domain Generalization
+# SCOPE: Shared Content Orchestration of Parameter-Efficient Experts for Federated Domain Generalization
 
 ## Requirements
-
 - Python 3.9.7
 - numpy 1.20.3
 - torch 1.11.0
 - torchvision 0.12.0
 
-![Training](figs/train.jpeg)
-Figure 1: Federated Domain Generalization Architecture. Each client (Domains A, B, C) processes local data through a frozen ViT-Base model followed by  a trainable MoE Adapter. The resulting parameters (µ, σ) are sent to the  federated server for aggregation.
+![OVerview](figs/overview.PNG)
+Figure 1. SCOPE’s Hierarchical Federation Strategy. Each client’s model is partitioned by layer depth. The Private Trunk (θp) learns domain-specific features (e.g., style, texture) and remains local, while the Shared Trunk (θs) learns domain-invariant semantic features and is the only component aggregated at the server. The feature heatmaps, generated via Grad-CAM, qualitatively illustrate this functional separation
 
-![Testing](figs/testclient.png)
-Figure 2: Federated Domain Generalization Inference Architecture. The server stores adapter parameters (μ, σ) from multiple domains. For an unseen domain, the client extracts features, calculates similarity to known domains, and creates weighted adapter parameters for final prediction while maintaining frozen ViT-Base backbones.
+![Main Framework](figs/main_arch.PNG)
+Figure 2. SCOPE Framework Overview. Phase A (Left): Three clients train on different domains with private trunks (domain-specific, remain local) and shared trunks (aggregated at server). Server (Center): ELMA performs expert-level matching using Hungarian algorithm; DRIFT aggregates layer-wise statistics for distribution alignment. Phase B (Right): Layer-wise test-time adaptation where each shared layer independently computes similarity, calculates weights, and blends parameters from all trained domains.
 
+![Results](figs/results.PNG)
+Table 1. Leave-one-domain-out evaluation results on OfficeHome, PACS, and VLCS, comparing SCOPE against a comprehensive set of baselines. The best federated performance is in bold.
+
+![Ablation](figs/Ablation.PNG)
+Figure 2. SCOPE Framework Overview. Phase A (Left): Three clients train on different domains with private trunks (domain-specific, remain local) and shared trunks (aggregated at server). Server (Center): ELMA performs expert-level matching using Hungarian algorithm; DRIFT aggregates layer-wise statistics for distribution alignment. Phase B (Right): Layer-wise test-time adaptation where each shared layer independently computes similarity, calculates weights, and blends parameters from all trained domains.
 ## Dataset
 
 Firstly create directory for log files and change the dataset path (`pacs_path`, `officehome_path` and `vlcs_path`) and log path (`log_count_path`) in configs/default.py.
@@ -27,9 +31,20 @@ Please download the datasets from the official links:
 
 To train using our best variant for office home and test on domain p, you can run the command:
 `
-python algorithms/feddg_moe/train_officehome.py --test_domain p --avg_tokens --num_layers 2 --test_batch_size 32 --domain_tracker offline_cosine_muvar --normalize_features --inv_temp 2 --note offlinecosinemuvar_nofeatnorm_invtemp2_4layer_avgtokens_fedupd_tbs32
-`
-Where we aggregate features from the last two transformer blocks, use a `--test_batch_size 32`, we track the mean and std stats of client features `--domain_tracker offline_cosine_muvar`, and we do normalize those features using the std `--normalize_features`. Mixing probabilities of client MoEs are calculated with a softmax of inverse temperature `--inv_temp 2` of 2 
+python3 algorithms/feddg_moe/train_officehome.py \
+    --test_domain p \
+    --batch_size 32 --log_similarities \
+    --model clip_moe_style \
+    --local_epochs 10 \
+    --comm 10 \
+    --private_blocks_count 4 \
+    --do_migs \
+    --migs_lambda_mean 5 \
+    --migs_lambda_cov 5 \
+    --agg_strategy elma \
+    --tta_blend_target layer_wise \
+    --note "baseline"
+
 
 ## Acknowledgement
 
