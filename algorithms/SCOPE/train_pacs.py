@@ -302,8 +302,8 @@ def collect_migs_stats(model, dataloader):
             
             mean_val = torch.mean(all_feats, dim=0)
             centered_feats = all_feats - mean_val
-            cov_val = (centered_feats.T @ centered_feats) / (all_feats.shape[0] - 1)
-            
+            cov_val = torch.var(all_feats, dim=0) 
+
             # Only move the final, small tensors to CPU for sending to server
             migs_stats_for_server[layer_idx] = {'mean': mean_val.cpu(), 'cov': cov_val.cpu()}
     
