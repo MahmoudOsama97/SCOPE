@@ -67,8 +67,9 @@ class MIGSLoss(torch.nn.Module):
         batch_mean = torch.mean(features, dim=0)
         loss_mean = self.mse_loss(batch_mean, global_mean)
         
-        centered_features = features - batch_mean
-        batch_cov = (centered_features.T @ centered_features) / (features.shape[0] - 1)
+        # We now calculate the variance vector for the mini-batch to match the target.
+        batch_cov = torch.var(features, dim=0)
+        
         loss_cov = self.mse_loss(batch_cov, global_cov)
         
         return (self.lambda_mean * loss_mean) + (self.lambda_cov * loss_cov)
