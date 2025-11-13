@@ -6,16 +6,16 @@
 - torch 1.11.0
 - torchvision 0.12.0
 
-![OVerview](figs/overview.PNG)
+![OVerview](figs/overview.png)
 Figure 1. SCOPE’s Hierarchical Federation Strategy. Each client’s model is partitioned by layer depth. The Private Trunk (θp) learns domain-specific features (e.g., style, texture) and remains local, while the Shared Trunk (θs) learns domain-invariant semantic features and is the only component aggregated at the server. The feature heatmaps, generated via Grad-CAM, qualitatively illustrate this functional separation
 
-![Main Framework](figs/main_arch.PNG)
+![Main Framework](figs/main_arch.png)
 Figure 2. SCOPE Framework Overview. Phase A (Left): Three clients train on different domains with private trunks (domain-specific, remain local) and shared trunks (aggregated at server). Server (Center): ELMA performs expert-level matching using Hungarian algorithm; DRIFT aggregates layer-wise statistics for distribution alignment. Phase B (Right): Layer-wise test-time adaptation where each shared layer independently computes similarity, calculates weights, and blends parameters from all trained domains.
 
-![Results](figs/results.PNG)
+![Results](figs/results.png)
 Table 1. Leave-one-domain-out evaluation results on OfficeHome, PACS, and VLCS, comparing SCOPE against a comprehensive set of baselines. The best federated performance is in bold.
 
-![Ablation](figs/Ablation.PNG)
+![Ablation](figs/Ablation.png)
 Figure 2. SCOPE Framework Overview. Phase A (Left): Three clients train on different domains with private trunks (domain-specific, remain local) and shared trunks (aggregated at server). Server (Center): ELMA performs expert-level matching using Hungarian algorithm; DRIFT aggregates layer-wise statistics for distribution alignment. Phase B (Right): Layer-wise test-time adaptation where each shared layer independently computes similarity, calculates weights, and blends parameters from all trained domains.
 ## Dataset
 
