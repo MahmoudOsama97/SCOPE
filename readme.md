@@ -20,7 +20,7 @@ Table 1. Leave-one-domain-out evaluation results on OfficeHome, PACS, and VLCS, 
 
 ![Ablation](figs/Ablation.png)
 
-Figure 2. SCOPE Framework Overview. Phase A (Left): Three clients train on different domains with private trunks (domain-specific, remain local) and shared trunks (aggregated at server). Server (Center): ELMA performs expert-level matching using Hungarian algorithm; DRIFT aggregates layer-wise statistics for distribution alignment. Phase B (Right): Layer-wise test-time adaptation where each shared layer independently computes similarity, calculates weights, and blends parameters from all trained domains.
+Figure 3. Analysis of SCOPE’s performance and sensitivity. In all plots, results for PACS in red, OfficeHome in blue, and VLCS in green areshown. (a) Convergence curves demonstrate stable and efficient learning. (b) Ablation study on the architectural partition point N . (c) Sensitivity analysis for the DRIFT regularization weight λ.
 ## Dataset
 
 Firstly create directory for log files and change the dataset path (`pacs_path`, `officehome_path` and `vlcs_path`) and log path (`log_count_path`) in configs/default.py.
