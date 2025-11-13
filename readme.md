@@ -34,7 +34,8 @@ Please download the datasets from the official links:
 ## Training / Testing
 
 To train using our best variant for office home and test on domain p, you can run the command:
-`
+
+
 python3 algorithms/feddg_moe/train_officehome.py \
     --test_domain p \
     --batch_size 32 --log_similarities \
